@@ -1,30 +1,11 @@
 // ===== brain/ConversationLayer.js =====
 
-import { runReasoner } from "../config/models.js";
-import {
-  appendMemory,
-  readMemory,
-} from "../modules/MemoryEngine.js";
-
-import { RelevancyEngine } from "../modules/Relevancy.js";   // ★ Yeni gelişmiş katman
+import { reasonerManager } from "../engine/ReasonerManager.js";
+import { appendMemory, readMemory } from "../modules/MemoryEngine.js";
+import { RelevancyEngine } from "../modules/Relevancy.js";   
 
 /**
- * ConversationLayer (Advanced + Relevancy Integration)
- * ----------------------------------------------------
- * 1) quickIntentCheck → hızlı tetikleyici
- * 2) relevancyEngine.analyze → bağlam + mesaj tipi + mode önerisi
- * 3) deepIntentReasoner → reasoning tabanlı mod seçimi
- *
- * Çıkış: {
- *   raw,
- *   intent,
- *   isChat,
- *   isPlan,
- *   isTask,
- *   projectIdHint,
- *   relevancy: {...},
- *   meta: { preAnalysis, relevancyAnalysis, deepAnalysis }
- * }
+ * ConversationLayer (with ReasonerManager Integration)
  */
 
 export class ConversationLayer {
@@ -36,27 +17,20 @@ export class ConversationLayer {
     });
   }
 
-  /**
-   * Kullanıcı mesajını alır → intent + context + projectId çıkartır.
-   */
   async processUserMessage(userMessage, options = {}) {
     const projectIdHint = await this.detectRelatedProject(userMessage);
 
-    // 0) Hafıza + konuşma geçmişini al
     const history = await this._getRecentMessages();
 
-    // 1) Quick intent (trigger bazlı)
     const pre = this.quickIntentCheck(userMessage);
 
-    // 2) RelevancyEngine analizi
     const rel = await this.relevancy.analyze({
       history,
       currentInput: userMessage,
-      preferences: {}, // ileride doldurulabilir
-      profile: {},     // ileride doldurulabilir
+      preferences: {},
+      profile: {},
     });
 
-    // Eğer quickIntent kesin sonuç verdiyse reasoning’e gitmeden döner
     if (pre.forceMode) {
       return this._buildOutput({
         userMessage,
@@ -68,7 +42,6 @@ export class ConversationLayer {
       });
     }
 
-    // Eğer relevancyEngine net bir mod önerdiyse (çok yüksek sinyal)
     if (rel.suggestedMode !== "mixed") {
       return this._buildOutput({
         userMessage,
@@ -80,7 +53,7 @@ export class ConversationLayer {
       });
     }
 
-    // 3) Derin reasoning → intent çıkarılır
+    // 🔥 runReasoner → ReasonerManager.run
     const deep = await this.reasonIntent(userMessage);
 
     const finalIntent = this._mergeIntent(pre, rel, deep);
@@ -95,9 +68,6 @@ export class ConversationLayer {
     });
   }
 
-  /* ------------------------------------------------------------
-   * Internal: çıktı inşası
-   * ------------------------------------------------------------ */
   _buildOutput({ userMessage, intent, projectIdHint, pre, rel, deep }) {
     const norm = this.normalizeIntent(intent);
 
@@ -108,8 +78,8 @@ export class ConversationLayer {
       isPlan: norm === "plan",
       isTask: norm === "task",
       projectIdHint,
-      contextText: rel.contextText,   // ★ AION.js'e direkt paslanır
-      relevancy: rel,                 // ★ Plan / Task / Chat tüm sistemde kullanılabilir
+      contextText: rel.contextText,
+      relevancy: rel,
       meta: {
         preAnalysis: pre,
         relevancyAnalysis: rel,
@@ -118,33 +88,20 @@ export class ConversationLayer {
     };
   }
 
-  /* ------------------------------------------------------------
-   * Intent Merge (pre + relevancy + deep)
-   * ------------------------------------------------------------ */
   _mergeIntent(pre, rel, deep) {
-    // 1) Quick intent en güçlü sinyal → override eder
     if (pre.forceMode) return pre.forceMode;
-
-    // 2) RelevancyEngine önerisi (strong)
     if (rel.suggestedMode !== "mixed") return rel.suggestedMode;
-
-    // 3) Deep intent
     if (deep?.intent && deep.intent !== "mixed") return deep.intent;
-
     return "mixed";
   }
 
-  /* ------------------------------------------------------------
-   * 1) QUICK INTENT CHECK
-   * ------------------------------------------------------------ */
   quickIntentCheck(text) {
     const lowered = text.toLowerCase();
 
-    // Task tetikleyicileri
     const taskTriggers = [
-      "oluştur", "yaz", "kodla", "generate",
-      "çalıştır", "çıktı üret", "patch", "agent yap",
-      "pipeline oluştur", "dosya yaz", "compile et", "uygula"
+      "oluştur","yaz","kodla","generate",
+      "çalıştır","çıktı üret","patch","agent yap",
+      "pipeline oluştur","dosya yaz","compile et","uygula"
     ];
 
     for (const t of taskTriggers) {
@@ -153,11 +110,10 @@ export class ConversationLayer {
       }
     }
 
-    // Plan tetikleyicileri
     const planTriggers = [
-      "bunu planlayalım", "beyin fırtınası", "mantığını oturtalım",
-      "nasıl yaparız", "nasıl işler", "adımlara bölelim",
-      "yol haritası", "architecture", "mimari", "tasarım planı"
+      "bunu planlayalım","beyin fırtınası","mantığını oturtalım",
+      "nasıl yaparız","nasıl işler","adımlara bölelim",
+      "yol haritası","architecture","mimari","tasarım planı"
     ];
 
     for (const p of planTriggers) {
@@ -166,9 +122,8 @@ export class ConversationLayer {
       }
     }
 
-    // Chat tetikleyicileri
     const chatTriggers = [
-      "nasılsın", "iyi misin", "sohbet", "sence", "ne düşünüyorsun"
+      "nasılsın","iyi misin","sohbet","sence","ne düşünüyorsun"
     ];
 
     for (const c of chatTriggers) {
@@ -181,7 +136,7 @@ export class ConversationLayer {
   }
 
   /* ------------------------------------------------------------
-   * 2) DEEP INTENT REASONING
+   * ReasonIntent — NOW USING REASONER MANAGER
    * ------------------------------------------------------------ */
   async reasonIntent(message) {
     const systemPrompt = `
@@ -189,21 +144,26 @@ Sen AION'un NİYET BEYNİSİN.
 
 Görevin:
 Kullanıcının mesajından hangi modun gerektiğini bulmak:
-- "chat": sohbet, açıklama
-- "plan": mimari, strateji
-- "task": somut iş (kod, dosya, pipeline)
+- "chat"
+- "plan"
+- "task"
+Belirsizse "mixed".
 
-Belirsizse → "mixed"
-
-Sadece JSON üret:
+JSON döndür:
 {
-  "intent": "chat | plan | task | mixed",
+  "intent": "...",
   "confidence": 0.0-1.0,
-  "summary": "kısa açıklama"
+  "summary": "..."
 }
 `.trim();
 
-    const raw = await runReasoner(systemPrompt, message);
+    const raw = await reasonerManager.run({
+      systemPrompt,
+      userPrompt: message,
+      mode: "classification",
+      maxTokens: 450,
+      temperature: 0.2,
+    });
 
     return this.safeParseIntent(raw);
   }
@@ -237,7 +197,7 @@ Sadece JSON üret:
   }
 
   /* ------------------------------------------------------------
-   * PROJECT DETECTION
+   * PROJECT DETECTION — ALSO MIGRATED TO REASONER MANAGER
    * ------------------------------------------------------------ */
   async detectRelatedProject(message) {
     const projects = readMemory("projects.json") || [];
@@ -245,8 +205,7 @@ Sadece JSON üret:
 
     const systemPrompt = `
 Sen AION'un proje eşleştirme modüsün.
-%60 üzeri semantic uyum varsa projectId döndür.
-Sadece JSON döndür.
+JSON formatında cevap ver.
 
 {
   "projectId": "id" | null,
@@ -255,16 +214,21 @@ Sadece JSON döndür.
 }
 `.trim();
 
-    const raw = await runReasoner(systemPrompt, `
+    const raw = await reasonerManager.run({
+      systemPrompt,
+      userPrompt: `
 Mesaj: ${message}
 Projeler: ${JSON.stringify(projects, null, 2)}
-`);
+      `,
+      mode: "matching",
+      temperature: 0.1,
+      maxTokens: 500,
+    });
 
     try {
       const s = raw.indexOf("{");
       const e = raw.lastIndexOf("}");
       const json = JSON.parse(raw.slice(s, e + 1));
-
       if (json.confidence >= 0.6) return json.projectId;
     } catch {}
 
@@ -272,7 +236,7 @@ Projeler: ${JSON.stringify(projects, null, 2)}
   }
 
   /* ------------------------------------------------------------
-   * Konuşma geçmişini getir (MemoryEngine)
+   * Recency history
    * ------------------------------------------------------------ */
   async _getRecentMessages() {
     try {
