@@ -5,40 +5,23 @@ import { ExecutionEngine } from "../engine/ExecutionEngine.js";
 import { appendMemory } from "../modules/MemoryEngine.js";
 import { ReasoningCompression } from "../modules/ReasoningCompression.js";
 
-/**
- * ControllerLayer
- * -------------------------------------------------------
- * Görev: PlannerLayer'dan gelen PipelineSpec'i,
- * ExecutionEngine ve agent'lar üzerinden adım adım çalıştırmak.
- *
- * Özellikler:
- *  - Sıralı step yürütme
- *  - step.retry desteği
- *  - step bazlı self-check (LLM ile)
- *  - pipeline bazlı self-check
- *  - ReasoningCompression ile self-check çıktılarının sıkıştırılması
- *  - detaylı log ve context kaydı
- */
-
 export class ControllerLayer {
   constructor() {
     this.executionEngine = new ExecutionEngine();
-    this.compressor = new ReasoningCompression(2000); // ★ LLM çıktıları için
+    this.compressor = new ReasoningCompression(2000);
   }
 
-  /**
-   * Ana fonksiyon:
-   * TaskSpec + PipelineSpec alır → pipelineResult döner.
-   */
   async runPipeline(taskSpec, pipelineSpec) {
     const startedAt = new Date().toISOString();
 
-    const context = {}; // step çıktıları burada birikir
+    const context = {};
     const logs = [];
     let status = "running";
     let failedStep = null;
 
-    // Adımları sırayla çalıştır
+    // -----------------------------------------
+    // 1) STEPLERI SIRAYLA ÇALIŞTIR
+    // -----------------------------------------
     for (const step of pipelineSpec.steps) {
       const stepLog = {
         id: step.id,
@@ -62,7 +45,6 @@ export class ControllerLayer {
         try {
           const input = this.buildStepInput(step, taskSpec, context);
 
-          // Agent çalıştır
           const output = await this.executionEngine.runAgent(
             step.agent,
             input,
@@ -71,7 +53,6 @@ export class ControllerLayer {
 
           attemptLog.rawOutput = output;
 
-          // Step self-check (LLM + compression)
           const selfCheck = await this.selfCheckStep(
             taskSpec,
             pipelineSpec,
@@ -82,7 +63,6 @@ export class ControllerLayer {
 
           attemptLog.selfCheck = selfCheck;
 
-          // Self-check başarısızsa bir daha dene
           if (!selfCheck.ok && attempt < maxRetry) {
             attemptLog.result = "selfcheck_failed_retrying";
           } else if (!selfCheck.ok && attempt >= maxRetry) {
@@ -90,7 +70,6 @@ export class ControllerLayer {
             lastOutput = output;
             lastError = new Error("Self-check başarısız.");
           } else {
-            // Başarılı
             success = true;
             lastOutput = output;
             attemptLog.result = "success";
@@ -98,7 +77,8 @@ export class ControllerLayer {
         } catch (err) {
           lastError = err;
           attemptLog.error = String(err?.message || err);
-          attemptLog.result = attempt < maxRetry ? "error_retrying" : "error_giveup";
+          attemptLog.result =
+            attempt < maxRetry ? "error_retrying" : "error_giveup";
         }
 
         attemptLog.finishedAt = new Date().toISOString();
@@ -111,7 +91,6 @@ export class ControllerLayer {
       stepLog.success = success;
       logs.push(stepLog);
 
-      // context'e step sonucu kaydet
       context[step.id] = {
         success,
         output: lastOutput,
@@ -125,12 +104,11 @@ export class ControllerLayer {
       }
     }
 
-    // Eğer hata yoksa status'i success/done olarak işaretle
-    if (status !== "error") {
-      status = "success";
-    }
+    if (status !== "error") status = "success";
 
-    // Pipeline-level self-check (LLM + compression)
+    // -----------------------------------------
+    // 2) PIPELINE SELF-CHECK
+    // -----------------------------------------
     const pipelineSelfCheck = await this.selfCheckPipeline(
       taskSpec,
       pipelineSpec,
@@ -152,7 +130,30 @@ export class ControllerLayer {
       finishedAt,
     };
 
-    // Memory log
+    // -----------------------------------------
+    // 3) PIPELINE HAFIZA AGENT'I ÇALIŞTIR
+    // -----------------------------------------
+    try {
+      await this.executionEngine.runAgent(
+        "MemoryPipelineAgent",
+        {
+          pipeline: result,
+          taskSpec,
+        },
+        context
+      );
+    } catch (err) {
+      // Hafıza hatası pipeline'ı BOZMAZ.
+      appendMemory("memory_pipeline_errors.json", {
+        error: String(err),
+        taskId: taskSpec.id,
+        createdAt: new Date().toISOString(),
+      });
+    }
+
+    // -----------------------------------------
+    // 4) LOG KAYDI
+    // -----------------------------------------
     appendMemory("pipeline_runs.json", {
       taskId: taskSpec.id,
       pipelineTaskId: pipelineSpec.taskId,
@@ -169,12 +170,6 @@ export class ControllerLayer {
     return result;
   }
 
-  /**
-   * Step input'unu üretmek:
-   * - pipeline'dan gelen inputTemplate
-   * - taskSpec.details
-   * - context (önceki stepler)
-   */
   buildStepInput(step, taskSpec, context) {
     return {
       ...step.input,
@@ -187,42 +182,21 @@ export class ControllerLayer {
     };
   }
 
-  /* ------------------------------------------------------------
-   * STEP SELF-CHECK
-   * ----------------------------------------------------------*/
   async selfCheckStep(taskSpec, pipelineSpec, step, input, output) {
     const systemPrompt = `
 Sen AION'un STEP SELF-CHECK modülüsün.
 
-Görevin:
-Bir pipeline adımının çıktısının mantıklı olup olmadığını hızlıca kontrol etmek.
-
 Kurallar:
-- "ok": true/false alanı olacak.
-- Eğer ok=false ise "reason" alanında kısa ve net açıklama olacak.
-- Teknik doğruluğu MÜKEMMEL kontrol edemezsin ama bariz saçmalıkları yakalamaya çalış.
-
-Örnek durumlar:
-- Kod istendi, ama kod bloğu yoksa → ok=false
-- Dosya path'i istendi ama output sadece "tamam" yazıyorsa → ok=false
-- Çok kısa / belirsiz cevaplar ama step kritik bir iş yapıyorsa → ok=false
-- Küçük stil/tarz kusurları → ok=true
-`.trim();
+- ok: boolean
+- reason: kısa açıklama
+`;
 
     const userPrompt = `
 Task goal:
 ${taskSpec.goal}
 
-Step info:
-${JSON.stringify(
-  {
-    id: step.id,
-    title: step.title,
-    agent: step.agent,
-  },
-  null,
-  2
-)}
+Step:
+${JSON.stringify(step, null, 2)}
 
 Input:
 ${JSON.stringify(input, null, 2)}
@@ -232,16 +206,12 @@ ${JSON.stringify(output, null, 2)}
 `;
 
     const raw = await runReasoner(systemPrompt, userPrompt);
-
-    // ★ LLM çıktısı çok uzunsa sıkıştır
     const cleaned = await this.compressor.compressIfLong(raw, {
       kind: "log",
       maxCharsOverride: 1500,
     });
 
-    const parsed = this.safeParseSelfCheckStep(cleaned);
-
-    return parsed;
+    return this.safeParseSelfCheckStep(cleaned);
   }
 
   safeParseSelfCheckStep(text) {
@@ -249,52 +219,29 @@ ${JSON.stringify(output, null, 2)}
       const start = text.indexOf("{");
       const end = text.lastIndexOf("}");
       const json = JSON.parse(text.slice(start, end + 1));
-
-      return {
-        ok: Boolean(json.ok),
-        reason: json.reason || "",
-      };
+      return { ok: Boolean(json.ok), reason: json.reason || "" };
     } catch {
-      return {
-        ok: true,
-        reason: "Self-check parse fallback: geçerli sayıldı.",
-      };
+      return { ok: true, reason: "parse fallback" };
     }
   }
 
-  /* ------------------------------------------------------------
-   * PIPELINE SELF-CHECK
-   * ----------------------------------------------------------*/
-  async selfCheckPipeline(
-    taskSpec,
-    pipelineSpec,
-    context,
-    logs,
-    status,
-    failedStep
-  ) {
+  async selfCheckPipeline(taskSpec, pipelineSpec, context, logs, status, failedStep) {
     const systemPrompt = `
 Sen AION'un PIPELINE SELF-CHECK beynisin.
-
-Görevin:
-Bütün pipeline çalışmasının son durumunu değerlendirip kısa bir değerlendirme yapmak.
-
 Kurallar:
-- "ok": true/false
-- "summary": kısa Türkçe özet
-- Görev başarıyla bittiyse ok=true
-- Eğer bazı adımlar hata verdiyse ama kısmi sonuç işe yarıyorsa ok=true olabilir ama summary'de dürüstçe belirt
-`.trim();
+- ok: boolean
+- summary: kısa açıklama
+`;
 
     const userPrompt = `
-TaskSpec:
+Task:
 ${JSON.stringify(taskSpec, null, 2)}
 
-PipelineSpec:
+Pipeline:
 ${JSON.stringify(pipelineSpec, null, 2)}
 
 Status: ${status}
-FailedStep: ${failedStep || "none"}
+FailedStep: ${failedStep}
 
 Context:
 ${JSON.stringify(context, null, 2)}
@@ -304,16 +251,12 @@ ${JSON.stringify(logs, null, 2)}
 `;
 
     const raw = await runReasoner(systemPrompt, userPrompt);
-
-    // ★ Burada da compress
     const cleaned = await this.compressor.compressIfLong(raw, {
       kind: "summary",
       maxCharsOverride: 2000,
     });
 
-    const parsed = this.safeParseSelfCheckPipeline(cleaned, status);
-
-    return parsed;
+    return this.safeParseSelfCheckPipeline(cleaned, status);
   }
 
   safeParseSelfCheckPipeline(text, status) {
@@ -321,7 +264,6 @@ ${JSON.stringify(logs, null, 2)}
       const start = text.indexOf("{");
       const end = text.lastIndexOf("}");
       const json = JSON.parse(text.slice(start, end + 1));
-
       return {
         ok: typeof json.ok === "boolean" ? json.ok : status === "success",
         summary: json.summary || "",
@@ -329,7 +271,7 @@ ${JSON.stringify(logs, null, 2)}
     } catch {
       return {
         ok: status === "success",
-        summary: "Pipeline self-check parse fallback.",
+        summary: "self-check fallback",
       };
     }
   }
