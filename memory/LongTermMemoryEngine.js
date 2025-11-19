@@ -3,158 +3,195 @@
 import fs from "fs";
 import path from "path";
 import { EmbeddingStore } from "./EmbeddingStore.js";
-import { MemoryWriter } from "./MemoryWriter.js";
-import { MemoryRetriever } from "./MemoryRetriever.js";
-import { MemorySchemas } from "./MemorySchemas.js";
 
 /**
- * LongTermMemoryEngine (HYBRID)
+ * LongTermMemoryEngine (HYBRID LTM)
  * ----------------------------------------------------------
- * 3 tip hafıza yönetir:
+ * Görev:
+ *  - Özetlenmiş uzun dönem hafıza kayıtlarını tutmak
+ *  - Embedding tabanlı arama sağlamak
  *
- * 1) Episodic Memory:
- *    - Konuşmalar, task'lar, pipeline sonuçları
+ * Kullanım:
+ *  - storeSummary({ text, summary, tags, source, importance })
+ *  - search(query, topK?)
  *
- * 2) Semantic / Vector Memory:
- *    - Embedding + nearest matching
- *
- * 3) Structured Memory:
- *    - Kalıcı kurallar, tercihler, alışkanlıklar
- *
- * Her modül kendi dosya dizininde çalışır,
- * bu engine hepsini tek API altında birleştirir.
+ * Notlar:
+ *  - Dosya formatı EmbeddingStore ile uyumludur.
+ *  - Her kayıt: { id, text, summary, tags, source, importance, embedding, createdAt }
  */
 
 export class LongTermMemoryEngine {
+  /**
+   * @param {object|string} config
+   *  - string ise: longterm.json dosya yolu
+   *  - object ise:
+   *      {
+   *        file?: string,       // longterm.json yolu
+   *        baseDir?: string,    // default: ./memory_data
+   *        maxItems?: number
+   *      }
+   */
   constructor(config = {}) {
-    // Memory klasörleri
-    this.dir = path.resolve(process.cwd(), "memory_data");
-    this.episodicFile = path.join(this.dir, "episodic.json");
-    this.semanticFile = path.join(this.dir, "semantic.json");
-    this.structuredFile = path.join(this.dir, "structured.json");
+    if (typeof config === "string") {
+      this.baseDir = path.dirname(config);
+      this.filePath = config;
+    } else {
+      this.baseDir =
+        config.baseDir || path.resolve(process.cwd(), "memory_data");
+      this.filePath =
+        config.file || path.join(this.baseDir, "longterm.json");
+    }
 
-    // Varsayılan ayarlar
-    this.maxEpisodic = config.maxEpisodic ?? 500;
-    this.maxSemantic = config.maxSemantic ?? 500;
+    this.maxItems = config.maxItems ?? 500;
 
-    // Alt modüller
-    this.embedder = new EmbeddingStore(this.semanticFile);
-    this.writer = new MemoryWriter(
-      this.episodicFile,
-      this.semanticFile,
-      this.structuredFile
-    );
-    this.retriever = new MemoryRetriever(
-      this.episodicFile,
-      this.semanticFile,
-      this.structuredFile
-    );
+    this._ensureFiles();
 
-    this.schemas = new MemorySchemas();
-
-    this._init();
+    // EmbeddingStore: longterm kayıtlarını buradan yönetir
+    this.store = new EmbeddingStore(this.filePath);
   }
 
-  _init() {
-    if (!fs.existsSync(this.dir)) {
-      fs.mkdirSync(this.dir, { recursive: true });
-    }
+  /* ------------------------------------------------------------
+   * Init
+   * ----------------------------------------------------------*/
+  _ensureFiles() {
+    try {
+      if (!fs.existsSync(this.baseDir)) {
+        fs.mkdirSync(this.baseDir, { recursive: true });
+      }
 
-    if (!fs.existsSync(this.episodicFile)) {
-      fs.writeFileSync(this.episodicFile, JSON.stringify([]));
-    }
-    if (!fs.existsSync(this.semanticFile)) {
-      fs.writeFileSync(this.semanticFile, JSON.stringify([]));
-    }
-    if (!fs.existsSync(this.structuredFile)) {
-      fs.writeFileSync(this.structuredFile, JSON.stringify(this.schemas.default));
+      if (!fs.existsSync(this.filePath)) {
+        fs.writeFileSync(this.filePath, JSON.stringify([]));
+      }
+    } catch (err) {
+      console.error("LongTermMemoryEngine init error:", err);
     }
   }
 
   /* ------------------------------------------------------------
-   * PUBLIC API
+   * PUBLIC: Generic store interface (opsiyonel)
    * ----------------------------------------------------------*/
-
   /**
-   * Uzun vadeli hafızaya yeni bir bilgi kaydeder
+   * Generic store wrapper — şimdilik summary'ye yönlendiriyor.
+   * @param {string} kind
+   * @param {object} payload
+   * @param {object} meta
+   */
+  async store(kind, payload = {}, meta = {}) {
+    // Şimdilik tek anlamlı tür: "summary" / "longterm"
+    if (kind === "summary" || kind === "longterm") {
+      return this.storeSummary(payload, meta);
+    }
+
+    // Diğer her şey de summary olarak işlenir
+    return this.storeSummary(payload, meta);
+  }
+
+  /* ------------------------------------------------------------
+   * PUBLIC: Uzun dönem özet kaydı
+   * ----------------------------------------------------------*/
+  /**
+   * Uzun dönem hafızaya yeni bir özet kaydı ekler.
    *
-   * @param {"episodic"|"semantic"|"structured"} type
-   * @param {object|string} payload
+   * @param {object} payload
+   *  - text?:   Orijinal ham içerik
+   *  - summary: Özet içerik (yoksa text kullanılır)
+   *  - tags?:   string[] etiket
+   *  - source?: nereden geldi (örn: "pipeline_run", "chat", "plan")
+   *  - importance?: 0-1 arası önem skoru
+   * @param {object} meta (şimdilik opsiyonel, future use)
    */
-  async store(type, payload, meta = {}) {
-    if (type === "episodic") return this._storeEpisodic(payload, meta);
-    if (type === "semantic") return this._storeSemantic(payload, meta);
-    if (type === "structured") return this._storeStructured(payload);
-    throw new Error(`Unknown memory type: ${type}`);
+  async storeSummary(payload = {}, meta = {}) {
+    const {
+      text = "",
+      summary = "",
+      tags = [],
+      source = "unknown",
+      importance = 0.5,
+    } = payload;
+
+    const baseText = summary || text;
+    if (!baseText || typeof baseText !== "string") {
+      throw new Error("LongTermMemoryEngine.storeSummary: summary/text boş olamaz.");
+    }
+
+    try {
+      const embedding = await this.store.generateEmbedding(baseText);
+
+      const entry = {
+        id: `lt_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        text,
+        summary: summary || text,
+        tags: Array.isArray(tags) ? tags : [],
+        source,
+        importance: typeof importance === "number" ? importance : 0.5,
+        embedding,
+        meta,
+        createdAt: new Date().toISOString(),
+      };
+
+      await this.store.add(entry);
+      // Şimdilik maxItems trim işlemini pas geçiyoruz;
+      // gerekirse EmbeddingStore içinde yönetilir.
+
+      return entry;
+    } catch (err) {
+      console.error("LongTermMemoryEngine.storeSummary error:", err);
+      throw err;
+    }
   }
 
+  /* ------------------------------------------------------------
+   * PUBLIC: Arama
+   * ----------------------------------------------------------*/
   /**
-   * Bellekten bağlam geri çağırır.
-   * Birkaç farklı türde context döner.
+   * Uzun dönem hafızada embedding tabanlı arama yapar.
+   *
+   * @param {string} query
+   * @param {number} topK
+   * @returns {Promise<Array<{id,summary,text,tags,source,score,createdAt}>>}
    */
-  async retrieve(query, options = {}) {
-    const episodic = await this.retriever.retrieveEpisodic(query, options);
-    const semantic = await this.retriever.retrieveSemantic(query, options);
-    const structured = await this.retriever.retrieveStructured(query, options);
+  async search(query, topK = 5) {
+    if (!query || typeof query !== "string") {
+      return [];
+    }
 
-    return {
-      episodic,
-      semantic,
-      structured,
-    };
+    try {
+      const queryEmbedding = await this.store.generateEmbedding(query);
+
+      const results = this.store.search(queryEmbedding, topK) || [];
+
+      // EmbeddingStore.search çıktısı: [{ item, score }]
+      return results.map((r) => {
+        const item = r.item || {};
+        return {
+          id: item.id,
+          summary: item.summary || item.text || "",
+          text: item.text || "",
+          tags: item.tags || [],
+          source: item.source || "unknown",
+          score: typeof r.score === "number" ? r.score : 0.5,
+          importance:
+            typeof item.importance === "number" ? item.importance : 0.5,
+          createdAt: item.createdAt,
+        };
+      });
+    } catch (err) {
+      console.error("LongTermMemoryEngine.search error:", err);
+      return [];
+    }
   }
 
   /* ------------------------------------------------------------
-   * EPISODIC MEMORY
+   * UTIL: Tüm kayıtları ham olarak okuma (debug vs.)
    * ----------------------------------------------------------*/
-  async _storeEpisodic(payload, meta) {
-    const entry = {
-      id: `ep_${Date.now()}_${Math.random().toString(16).slice(2)}`,
-      text:
-        typeof payload === "string"
-          ? payload
-          : JSON.stringify(payload, null, 2),
-      meta: meta || {},
-      createdAt: new Date().toISOString(),
-    };
-
-    await this.writer.writeEpisodic(entry, this.maxEpisodic);
-    return entry;
-  }
-
-  /* ------------------------------------------------------------
-   * SEMANTIC / VECTOR MEMORY
-   * ----------------------------------------------------------*/
-  async _storeSemantic(payload, meta) {
-    const text =
-      typeof payload === "string"
-        ? payload
-        : JSON.stringify(payload, null, 2);
-
-    const embedding = await this.embedder.generateEmbedding(text);
-
-    const entry = {
-      id: `sem_${Date.now()}_${Math.random().toString(16).slice(2)}`,
-      text,
-      embedding,
-      meta: meta || {},
-      createdAt: new Date().toISOString(),
-    };
-
-    await this.writer.writeSemantic(entry, this.maxSemantic);
-    return entry;
-  }
-
-  /* ------------------------------------------------------------
-   * STRUCTURED MEMORY
-   * ----------------------------------------------------------*/
-  async _storeStructured(payload) {
-    const structured = this.retriever.loadStructured();
-    const updated = {
-      ...structured,
-      ...payload,
-    };
-    await this.writer.writeStructured(updated);
-    return updated;
+  readAllRaw() {
+    try {
+      const raw = fs.readFileSync(this.filePath, "utf8");
+      return JSON.parse(raw);
+    } catch {
+      return [];
+    }
   }
 }
+
+export default LongTermMemoryEngine;
