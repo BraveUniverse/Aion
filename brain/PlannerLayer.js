@@ -1,6 +1,6 @@
 // ===== brain/PlannerLayer.js =====
 
-import { runReasoner } from "../config/models.js";
+import { reasonerManager } from "../engine/ReasonerManager.js";
 import {
   appendMemory,
   readMemory,
@@ -8,7 +8,6 @@ import {
 } from "../modules/MemoryEngine.js";
 import { TaskTypeRegistry } from "../modules/TaskTypeRegistry.js";
 
-// ★ Yeni gelişmiş katmanlar:
 import { ToolArbitration } from "../modules/ToolArbitration.js";
 import { ReasoningCompression } from "../modules/ReasoningCompression.js";
 
@@ -31,22 +30,18 @@ export class PlannerLayer {
   }
 
   /**
-   * Ana planlama fonksiyonu
-   * PipelineSpec üretir
+   * Ana planlama fonksiyonu (PipelineSpec üretir)
    */
   async plan(taskSpec, convMeta = {}) {
     const { type } = taskSpec;
     const blueprintExists = this.blueprints[type];
 
-    // Eğer blueprint varsa → doğrudan pipeline üret
     if (blueprintExists) {
       return this.generatePipelineFromBlueprint(taskSpec, blueprintExists, convMeta);
     }
 
-    // Yeni type → dynamic blueprint
     const newBlueprint = await this.createBlueprintForNewType(taskSpec, convMeta);
 
-    // kaydet
     this.blueprints[type] = newBlueprint;
     this._saveBlueprints();
 
@@ -63,7 +58,6 @@ export class PlannerLayer {
     for (let i = 0; i < blueprint.steps.length; i++) {
       const step = blueprint.steps[i];
 
-      // ★ ToolArbitration: blueprint'teki agent doğru mu?
       const decision = await this.toolArbiter.decide(
         {
           goal: taskSpec.goal,
@@ -82,7 +76,7 @@ export class PlannerLayer {
       finalSteps.push({
         id: `step_${i + 1}`,
         title: step.title,
-        agent: decision.primary, // ★ seçilen agent
+        agent: decision.primary,
         input: {
           ...step.inputTemplate,
           taskGoal: taskSpec.goal,
@@ -114,7 +108,7 @@ export class PlannerLayer {
   }
 
   /* ------------------------------------------------------------
-   * YENİ TYPE İÇİN DİNAMİK BLUEPRINT
+   * YENİ TYPE → Dinamik Blueprint
    * ----------------------------------------------------------*/
   async createBlueprintForNewType(taskSpec, convMeta) {
     const allowedAgents = [
@@ -131,25 +125,20 @@ Sen AION'un PIPELINE BEYNİSIN.
 Yeni görev tipi: "${taskSpec.type}"
 
 Görevin:
-Bu görev tipi için net, kısa, verimli, mantıklı bir "pipeline blueprint" oluştur.
+Bu görev tipi için verimli bir pipeline blueprint üret.
 
 Kurallar:
-- Adım sayısı 2–5 arasında olmalı
-- Her adımda sadece 1 agent kullanılmalı
-- agent sadece şu listeden biri olacak:
+- Adım sayısı 2–5
+- Her adımda tek agent
+- Agent sadece şu listeden biri:
   ${allowedAgents.join(" | ")}
 
-Çıkış YALNIZCA JSON olacak:
+SADECE JSON:
 {
   "source": "auto_generated",
   "type": "${taskSpec.type}",
   "steps": [
-    {
-      "title": "...",
-      "agent": "CodeAgent",
-      "inputTemplate": {},
-      "retry": 1
-    }
+    { "title": "...", "agent": "CodeAgent", "inputTemplate": {}, "retry": 1 }
   ]
 }
 `.trim();
@@ -162,9 +151,15 @@ Bağlam:
 ${JSON.stringify(convMeta, null, 2)}
 `;
 
-    const raw = await runReasoner(systemPrompt, userPrompt);
+    // 🔥 ReasonerManager çağrısı
+    const raw = await reasonerManager.run({
+      systemPrompt,
+      userPrompt,
+      mode: "blueprint_generation",
+      temperature: 0.3,
+      maxTokens: 1100,
+    });
 
-    // ★ Reasoning compression
     const cleaned = await this.compressor.compressIfLong(raw, {
       kind: "blueprint",
       maxCharsOverride: 2200,
@@ -173,7 +168,6 @@ ${JSON.stringify(convMeta, null, 2)}
 
     const parsed = this.safeParseBlueprint(cleaned, taskSpec.type);
 
-    // Self-check & düzeltme
     const validated = await this.selfCheckBlueprint(parsed, taskSpec.type);
 
     return validated;
@@ -185,7 +179,6 @@ ${JSON.stringify(convMeta, null, 2)}
       const e = text.lastIndexOf("}");
       return JSON.parse(text.slice(s, e + 1));
     } catch {
-      // fallback
       return {
         source: "fallback",
         type: typeName,
@@ -194,13 +187,13 @@ ${JSON.stringify(convMeta, null, 2)}
             title: "Research underlying task",
             agent: "ResearchAgent",
             inputTemplate: {},
-            retry: 1
+            retry: 1,
           },
           {
             title: "Generate final output",
             agent: "CodeAgent",
             inputTemplate: {},
-            retry: 1
+            retry: 1,
           }
         ]
       };
@@ -214,23 +207,28 @@ ${JSON.stringify(convMeta, null, 2)}
     const systemPrompt = `
 Sen AION Pipeline Self-Check Beynisisin.
 
-Blueprint doğrulama kuralları:
-- steps bir array olmalı
-- uzunluk 1–8 arasında olmalı
-- title string olmalı
-- agent geçerli olmalı
-- inputTemplate obje olmalı
+Kurallar:
+- steps array olmalı
+- uzunluk 1–8
+- title string
+- agent geçerli
+- inputTemplate obje
 
-Hatalıysa düzelt.
-ÇIKTI SADECE JSON:
-
+Hataları düzelt.
+ÇIKTI JSON:
 {
   "valid": true/false,
   "blueprint": { ... }
 }
 `;
 
-    const raw = await runReasoner(systemPrompt, JSON.stringify(blueprint, null, 2));
+    const raw = await reasonerManager.run({
+      systemPrompt,
+      userPrompt: JSON.stringify(blueprint, null, 2),
+      mode: "blueprint_validation",
+      temperature: 0.1,
+      maxTokens: 900,
+    });
 
     const cleaned = await this.compressor.compressIfLong(raw, {
       kind: "blueprint_check",
