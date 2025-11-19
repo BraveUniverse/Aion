@@ -2,110 +2,125 @@
 
 import fs from "fs";
 import path from "path";
+import sqlite3 from "sqlite3";
+import { open } from "sqlite";
 import { runEmbeddingModel } from "../config/models.js";
 
 /**
  * EmbeddingStore
- * -------------------------------------------------------
- * - semantic.json içindeki embedding kayıtlarını yönetir.
- * - runEmbeddingModel(model, text) kullanarak embedding üretir.
- * - En yakın komşu hesaplamasını içerir.
+ * ---------------------------------------------------------
+ * - semantic memory'nin veri deposu
+ * - SQLite + JSON metadata
+ * - generateEmbedding(text)
+ * - storeItem({ text, meta, embedding })
+ * - search(queryEmbedding)
  */
 
 export class EmbeddingStore {
-  constructor(filePath) {
-    this.filePath = filePath;
-    this.data = this._load();
+  constructor(dbPath) {
+    this.dbPath = dbPath;
+    this.db = null;
+    this.dim = 1024; // Default embedding boyutu
   }
 
-  /* ------------------------------------------------------------
-   * INIT / LOAD
-   * ----------------------------------------------------------*/
-  _load() {
-    try {
-      if (!fs.existsSync(this.filePath)) {
-        return [];
-      }
-      return JSON.parse(fs.readFileSync(this.filePath, "utf8"));
-    } catch (err) {
-      console.error("EmbeddingStore LOAD error:", err);
-      return [];
-    }
-  }
+  /* --------------------------------------------------------
+   * DB INIT
+   * ------------------------------------------------------*/
+  async _init() {
+    if (this.db) return;
 
-  _save() {
-    try {
-      fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
-    } catch (err) {
-      console.error("EmbeddingStore SAVE error:", err);
-    }
-  }
-
-  /* ------------------------------------------------------------
-   * PUBLIC: Embedding oluştur
-   * ----------------------------------------------------------*/
-  async generateEmbedding(text) {
-    try {
-      const emb = await runEmbeddingModel(text);
-      return emb;
-    } catch (err) {
-      console.error("EmbeddingStore generateEmbedding error:", err);
-      return [];
-    }
-  }
-
-  /* ------------------------------------------------------------
-   * PUBLIC: Yeni kayıt ekle
-   * ----------------------------------------------------------*/
-  add(entry, maxCount = 500) {
-    this.data.push(entry);
-
-    // Kapasite aşılırsa en eski kaydı sil
-    if (this.data.length > maxCount) {
-      this.data.shift();
-    }
-
-    this._save();
-  }
-
-  /* ------------------------------------------------------------
-   * PUBLIC: En yakın semantic sonuçlar
-   * ----------------------------------------------------------*/
-  async nearest(text, topK = 5) {
-    if (this.data.length === 0) return [];
-
-    const queryEmb = await this.generateEmbedding(text);
-
-    const scored = this.data.map((item) => {
-      try {
-        return {
-          ...item,
-          score: cosineSimilarity(queryEmb, item.embedding),
-        };
-      } catch {
-        return { ...item, score: 0 };
-      }
+    this.db = await open({
+      filename: this.dbPath,
+      driver: sqlite3.Database,
     });
 
-    return scored.sort((a, b) => b.score - a.score).slice(0, topK);
+    // Tablo yoksa oluştur
+    await this.db.exec(`
+      CREATE TABLE IF NOT EXISTS embeddings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT,
+        meta TEXT,
+        embedding BLOB,
+        timestamp TEXT
+      );
+    `);
+  }
+
+  /* --------------------------------------------------------
+   * EMBEDDING OLUŞTURMA
+   * ------------------------------------------------------*/
+  async generateEmbedding(text) {
+    // 1) Modelle embed oluştur
+    const result = await runEmbeddingModel(text);
+
+    if (!result || !Array.isArray(result.embedding)) {
+      throw new Error("EmbeddingStore: Geçersiz embedding çıktısı.");
+    }
+
+    this.dim = result.embedding.length;
+
+    return Float32Array.from(result.embedding);
+  }
+
+  /* --------------------------------------------------------
+   * STORE ITEM
+   * ------------------------------------------------------*/
+  async storeItem({ text, meta, embedding, timestamp }) {
+    await this._init();
+
+    const buffer = Buffer.from(embedding.buffer);
+
+    await this.db.run(
+      `
+      INSERT INTO embeddings (text, meta, embedding, timestamp)
+      VALUES (?, ?, ?, ?)
+      `,
+      text,
+      JSON.stringify(meta || {}),
+      buffer,
+      timestamp
+    );
+  }
+
+  /* --------------------------------------------------------
+   * SEMANTIC SEARCH
+   * ------------------------------------------------------*/
+  async searchByEmbedding(queryEmbedding, limit = 5) {
+    await this._init();
+
+    const rows = await this.db.all(`SELECT * FROM embeddings`);
+
+    if (!rows || rows.length === 0) return [];
+
+    const q = Array.from(queryEmbedding);
+
+    // cosine similarity hesaplama
+    const similarities = rows.map((row) => {
+      const emb = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+      const sim = cosineSimilarity(q, emb);
+      return { ...row, score: sim };
+    });
+
+    // Skora göre sırala
+    return similarities
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
   }
 }
 
-/* ------------------------------------------------------------
- * Cosine similarity helper
- * ----------------------------------------------------------*/
+/* --------------------------------------------------------
+ * COSINE SIMILARITY
+ * ------------------------------------------------------*/
 function cosineSimilarity(a, b) {
-  if (!a || !b || a.length !== b.length) return 0;
-
-  let dot = 0,
-    normA = 0,
-    normB = 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
 
   for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
-    normA += a[i] ** 2;
-    normB += b[i] ** 2;
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
   }
 
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-8);
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-8);
 }
