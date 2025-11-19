@@ -4,16 +4,22 @@ import { runReasoner } from "../config/models.js";
 import { appendMemory } from "../modules/MemoryEngine.js";
 import { TaskTypeRegistry } from "../modules/TaskTypeRegistry.js";
 
+// ★ Yeni eklenen gelişmiş modüller:
+import { ToolArbitration } from "../modules/ToolArbitration.js";
+import { ReasoningCompression } from "../modules/ReasoningCompression.js";
+
 export class InterpreterLayer {
   constructor() {
     this.registry = new TaskTypeRegistry();
+    this.toolArbiter = new ToolArbitration();            // ★ agent seçimi
+    this.compressor = new ReasoningCompression(2000);    // ★ reasoning kısaltma
   }
 
   /**
    * Mode'a göre TaskSpec karar mekanizması
    */
   async interpret(convInfo) {
-    const { raw, intent, projectIdHint } = convInfo;
+    const { raw, intent, projectIdHint, relevancy } = convInfo;
 
     // PLAN MODU → TaskSpec üretmez
     if (intent === "plan") {
@@ -25,11 +31,24 @@ export class InterpreterLayer {
       return this.noTask("Chat modunda TaskSpec üretilmez.", raw, projectIdHint);
     }
 
-    // TASK veya MIXED mod → gerçek TaskSpec reasoner
+    // TASK veya MIXED mod → reasoner ile TaskSpec çıkar
     const interpreted = await this.reasonTaskSpec(raw, projectIdHint);
 
-    // Yeni görev tipleri otomatik öğrenilir
+    // Yeni görev tiplerini kaydet
     this.learnTypeIfNew(interpreted.type);
+
+    // ★ ToolArbitration: hangi agent çalışacak?
+    const agentDecision = await this.toolArbiter.decide(
+      interpreted,
+      [], // availableAgents boş → defaultAgents
+      {
+        messageType: relevancy?.messageType,
+        suggestedMode: relevancy?.suggestedMode,
+      }
+    );
+
+    interpreted.agent = agentDecision.primary;
+    interpreted.agentDecision = agentDecision;
 
     // Hafıza kaydı
     appendMemory("interpreted_raw.json", {
@@ -74,25 +93,29 @@ NOT:
 - Aşağıdaki liste sadece mevcut görev tipleridir:
   ${allowedTypes}
 
-Ama kullanıcı bu listede olmayan BİR TANE BİLE yeni görev tipi isterse:
-- Yeni bir type oluşturabilirsin
-- AION bunu otomatik öğrenecek
-- Kısıtlama yok
+Ama kullanıcı yeni bir görev tipi isterse yeni bir "type" oluştur.
+AION bunu otomatik öğrenecek.
 
-ÇIKTI FORMAT (KESİN):
+ÇIKTI FORMAT:
 {
   "goal": "string",
   "type": "string",
-  "details": {
-    "...": "..."
-  }
+  "details": { "...": "..." }
 }
 `.trim();
 
-    const raw = await runReasoner(systemPrompt, message);
-    const parsed = this.safeParseTaskSpec(raw);
+    const rawOutput = await runReasoner(systemPrompt, message);
 
-    // ID ve meta ekle
+    // ★ ReasoningCompression — output’u temizle
+    const cleaned = await this.compressor.compressIfLong(rawOutput, {
+      kind: "reasoning",
+      maxCharsOverride: 1800,
+      taskSpec: null,
+    });
+
+    const parsed = this.safeParseTaskSpec(cleaned);
+
+    // Meta ekle
     parsed.id = `task_${Date.now()}`;
     parsed.projectId = projectIdHint || null;
     parsed.createdAt = new Date().toISOString();
@@ -102,10 +125,10 @@ Ama kullanıcı bu listede olmayan BİR TANE BİLE yeni görev tipi isterse:
 
   safeParseTaskSpec(text) {
     try {
-      const start = text.indexOf("{");
-      const end = text.lastIndexOf("}");
-      if (start >= 0 && end > start) {
-        return JSON.parse(text.slice(start, end + 1));
+      const s = text.indexOf("{");
+      const e = text.lastIndexOf("}");
+      if (s >= 0 && e > s) {
+        return JSON.parse(text.slice(s, e + 1));
       }
     } catch (e) {
       console.error("TaskSpec parse error:", e);
@@ -130,6 +153,7 @@ Ama kullanıcı bu listede olmayan BİR TANE BİLE yeni görev tipi isterse:
       projectId,
       goal: raw,
       type: "no_task_generated",
+      agent: null,
       details: { reason },
       createdAt: new Date().toISOString(),
     };
