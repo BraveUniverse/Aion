@@ -1,197 +1,190 @@
 // ===== memory/MemoryOrchestrator.js =====
+// AION Hybrid Memory Brain (FULL VERSION)
 
 import { MemoryReader } from "./MemoryReader.js";
 import { EmbeddingStore } from "./EmbeddingStore.js";
+import { LongTermMemoryEngine } from "./LongTermMemoryEngine.js";
+import { CategoricalMemory } from "./CategoricalMemory.js";
 import { readMemory } from "../modules/MemoryEngine.js";
 
 /**
- * MemoryOrchestrator (Hybrid Memory Brain)
+ * MemoryOrchestrator
  * -------------------------------------------------------
- * Görev:
- *  - Kullanıcı mesajı için en iyi hafıza karışımını üretir:
- *      1) episodic memory (yakın geçmiş)
- *      2) semantic memory (embedding tabanlı)
- *      3) structured memory (planlar, projeler, görevler)
- *      4) long-term categorical memory (kategori bazlı özet)
+ * AION’un FINAL hafıza birleştiricisi.
  *
- *  - Hepsini skorlayıp tek bir contextPack halinde Reasoner'a sunar.
+ * Kullanıcı mesajı için:
+ *  1) Episodic memory
+ *  2) Semantic memory
+ *  3) Structured memory
+ *  4) Categorical memory
+ *  5) Long-term memory (özetlenmiş kalıcı bilgiler)
+ *
+ * Tümünü skorlayıp ContextPack üretir.
  */
 
 export class MemoryOrchestrator {
-  constructor() {
-    this.reader = new MemoryReader();
-    this.embedder = new EmbeddingStore();
+  constructor(paths = {}) {
+    this.reader = new MemoryReader(paths);
+    this.embedder = new EmbeddingStore(paths.semantic);
+    this.longterm = new LongTermMemoryEngine(paths.longterm);
+    this.categorical = new CategoricalMemory(paths.categorical);
+
+    this.MAX_CONTEXT_ITEMS = 12;
   }
 
   /**
-   * Ana fonksiyon:
-   * Kullanıcı mesajı → hybrid memory context.
+   * Ana API:
+   *  → User input
+   *  ← Hybrid memory contextPack
    */
   async buildContextPack(userMessage) {
-    const queryEmbedding = await this.embedder.generateEmbedding(userMessage);
+    const embedding = await this.embedder.generateEmbedding(userMessage);
 
-    // 1) Episodic memory: son 20 mesaj
-    const episodic = this.collectEpisodic();
+    // 1) Episodic — yakın geçmiş
+    const episodic = this.collectEpisodic(20);
 
-    // 2) Semantic memory: embedding store'dan en yakın 5 kayıt
-    const semantic = await this.reader.querySimilar(userMessage, 5);
+    // 2) Semantic — benzer içerikler
+    const semantic = await this.reader.querySimilar(userMessage, 6);
 
-    // 3) Structured memory (planlar, projeler, görevler)
+    // 3) Structured — kurallar, projeler, planlar
     const structured = this.collectStructured(userMessage);
 
-    // 4) Long-term categorical memory
-    const longTerm = this.collectLongTerm(userMessage);
+    // 4) Categorical — kategoriye göre uzun dönem
+    const categorical = this.collectCategorical(userMessage);
 
-    // 5) Skorlayıp birleştiriyoruz
-    const merged = this.mergeAndRank({
+    // 5) Long-term — özetlenmiş bilgiler
+    const longterm = await this.collectLongTerm(userMessage);
+
+    // 6) Hepsini ağırlıklı birleştir
+    const merged = await this.mergeAndScore({
       episodic,
       semantic,
       structured,
-      longTerm
-    }, queryEmbedding);
+      categorical,
+      longterm
+    }, embedding);
+
+    // 7) Final text oluştur
+    const contextPack = this.buildContextString(merged.slice(0, this.MAX_CONTEXT_ITEMS));
 
     return {
-      contextPack: this.buildContextString(merged),
+      contextPack,
       sources: merged
     };
   }
 
-  /* -------------------------------------------------------
-   * 1) Episodic Memory — Son mesajlar
-   * -----------------------------------------------------*/
+  /* ------------------------------------------------------------
+   * 1) EPISODIC
+   * ----------------------------------------------------------*/
   collectEpisodic(limit = 20) {
-    const msgs = readMemory("messages.json") || [];
-    return msgs.slice(-limit).map(m => ({
-      type: "episodic",
-      score: 0.3,
-      data: m
+    const data = readMemory("episodic.json") || [];
+    const sliced = data.slice(-limit);
+
+    return sliced.map(m => ({
+      channel: "episodic",
+      score: 0.35,
+      text: `${m.role}: ${m.text}`,
+      raw: m
     }));
   }
 
-  /* -------------------------------------------------------
-   * 2) Structured Memory — Projeler, planlar, görevler
-   * -----------------------------------------------------*/
+  /* ------------------------------------------------------------
+   * 2) STRUCTURED MEMORY
+   * ----------------------------------------------------------*/
   collectStructured(userMessage) {
-    const projects = readMemory("projects.json") || [];
-    const plans = readMemory("plans.json") || [];
-    const tasks = readMemory("tasks.json") || [];
+    const db = readMemory("structured.json") || {};
+    const msg = userMessage.toLowerCase();
 
-    const msgLower = userMessage.toLowerCase();
+    const res = [];
 
-    const result = [];
+    for (const key of Object.keys(db)) {
+      const entry = db[key];
+      const txt = JSON.stringify(entry.value || "").toLowerCase();
 
-    for (const p of projects) {
-      const hit =
-        p.title?.toLowerCase().includes(msgLower) ||
-        p.description?.toLowerCase().includes(msgLower);
+      const match = txt.includes(msg) ? 0.9 : 0.5;
 
-      result.push({
-        type: "structured_project",
-        score: hit ? 0.8 : 0.4,
-        data: p
+      res.push({
+        channel: "structured",
+        score: match,
+        text: `${key}: ${JSON.stringify(entry.value)}`,
+        raw: entry
       });
     }
 
-    for (const pl of plans) {
-      const hit =
-        pl.plan?.planTitle?.toLowerCase().includes(msgLower) ||
-        pl.input?.toLowerCase().includes(msgLower);
-
-      result.push({
-        type: "structured_plan",
-        score: hit ? 0.7 : 0.4,
-        data: pl
-      });
-    }
-
-    for (const t of tasks) {
-      const hit = t.goal?.toLowerCase().includes(msgLower);
-
-      result.push({
-        type: "structured_task",
-        score: hit ? 0.6 : 0.3,
-        data: t
-      });
-    }
-
-    return result;
+    return res;
   }
 
-  /* -------------------------------------------------------
-   * 3) Long-Term Categorical Memory (future use)
-   * -----------------------------------------------------*/
-  collectLongTerm(userMessage) {
-    const cats = readMemory("memory_categories.json") || [];
+  /* ------------------------------------------------------------
+   * 3) CATEGORICAL MEMORY
+   * ----------------------------------------------------------*/
+  collectCategorical(userMessage) {
+    const records = this.categorical.getAll();
+    const msg = userMessage.toLowerCase();
 
-    const msgLower = userMessage.toLowerCase();
+    return records.map(rec => {
+      const text = JSON.stringify(rec.data).toLowerCase();
+      const hit = text.includes(msg);
 
-    return cats.map(c => ({
-      type: "long_term",
-      score: c.keywords.some(k => msgLower.includes(k.toLowerCase()))
-        ? 0.75
-        : 0.35,
-      data: c
+      return {
+        channel: "categorical",
+        score: hit ? 0.75 : 0.45,
+        text: `[${rec.category}] ${rec.data.text}`,
+        raw: rec
+      };
+    });
+  }
+
+  /* ------------------------------------------------------------
+   * 4) LONG TERM MEMORY
+   * ----------------------------------------------------------*/
+  async collectLongTerm(userMessage) {
+    const summaries = await this.longterm.search(userMessage);
+    return summaries.map(s => ({
+      channel: "longterm",
+      score: s.score || 0.6,
+      text: `[LT] ${s.summary}`,
+      raw: s
     }));
   }
 
-  /* -------------------------------------------------------
-   * 4) Tüm hafıza sonuçlarını birleştirip sıralamak
-   * -----------------------------------------------------*/
-  mergeAndRank(allMemorySources, queryEmbedding) {
-    // Hepsini tek dizi yap
+  /* ------------------------------------------------------------
+   * 5) MERGE & SCORE (Hybrid)
+   * ----------------------------------------------------------*/
+  async mergeAndScore(channels, queryEmbedding) {
     const all = [
-      ...allMemorySources.episodic,
-      ...allMemorySources.semantic,
-      ...allMemorySources.structured,
-      ...allMemorySources.longTerm
+      ...channels.episodic,
+      ...channels.semantic,
+      ...channels.structured,
+      ...channels.categorical,
+      ...channels.longterm
     ];
 
-    // Legacy: semantic kayıtlar zaten kendi distance skoruyla geliyor
-    // diğerlerini normalize edeceğiz
+    // Semantic kendi distance skorunu içeriyor
+    const normalized = await Promise.all(
+      all.map(async item => {
+        let score = item.score ?? 0.3;
 
-    const normalized = all.map(item => {
-      let finalScore = item.score;
-
-      // Semantic ise distance'ın etkisi zaten var
-      if (item.type !== "semantic") {
-        // Score boost: eğer item.data içinde çok yakın bir eşleşme varsa
-        const dataStr = JSON.stringify(item.data).toLowerCase();
-        const msgStr = JSON.stringify(queryEmbedding).toLowerCase();
-
-        if (dataStr.includes(msgStr.slice(0, 8))) {
-          finalScore += 0.2;
+        // semantic dışı kaynaklar için embedding similarity boost
+        if (item.channel !== "semantic") {
+          const sim = await this.embedder.similarity(queryEmbedding, item.text);
+          score += sim * 0.35; // ağır etkili
         }
-      }
 
-      return { ...item, finalScore };
-    });
+        return { ...item, finalScore: score };
+      })
+    );
 
-    // Skora göre sırala
-    return normalized.sort((a, b) => b.finalScore - a.finalScore).slice(0, 10);
+    return normalized.sort((a, b) => b.finalScore - a.finalScore);
   }
 
-  /* -------------------------------------------------------
-   * 5) Final context string oluşturma
-   * -----------------------------------------------------*/
+  /* ------------------------------------------------------------
+   * 6) CONTEXT STRING
+   * ----------------------------------------------------------*/
   buildContextString(items) {
     return items
       .map(i => {
-        switch (i.type) {
-          case "episodic":
-            return `[EPISODIC] ${i.data.role}: ${i.data.text}`;
-          case "semantic":
-            return `[SEMANTIC] ${i.data.originalText}`;
-          case "structured_project":
-            return `[PROJECT] ${i.data.title || i.data.id}`;
-          case "structured_plan":
-            return `[PLAN] ${i.data.plan?.planTitle}`;
-          case "structured_task":
-            return `[TASK] ${i.data.goal}`;
-          case "long_term":
-            return `[LONGTERM] ${i.data.category}: ${i.data.summary}`;
-        }
+        return `[${i.channel.toUpperCase()}] ${i.text}`;
       })
-      .filter(Boolean)
       .join("\n");
   }
 }
