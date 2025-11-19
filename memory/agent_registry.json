@@ -1,0 +1,8 @@
+{
+  "agents": {
+    "CodeAgent": "agents/CodeAgent.js",
+    "FileAgent": "agents/FileAgent.js",
+    "FixAgent": "agents/FixAgent.js",
+    "ResearchAgent": "agents/ResearchAgent.js"
+  }
+}
