@@ -2,109 +2,101 @@
 
 import fs from "fs";
 import path from "path";
-import sqlite3 from "sqlite3";
-import { open } from "sqlite";
 import { runEmbeddingModel } from "../config/models.js";
 
 /**
- * EmbeddingStore
+ * EmbeddingStore (JSON-based, High Compatibility)
  * ---------------------------------------------------------
- * - semantic memory'nin veri deposu
- * - SQLite + JSON metadata
- * - generateEmbedding(text)
- * - storeItem({ text, meta, embedding })
- * - search(queryEmbedding)
+ * LongTermMemoryEngine ve MemoryReader ile %100 uyumludur.
+ *
+ * Format:
+ * [
+ *   {
+ *     id: "lt_...",
+ *     text: "...",
+ *     summary: "...",
+ *     tags: [...],
+ *     source: "...",
+ *     importance: 0.7,
+ *     embedding: [...],
+ *     createdAt: "2025-02-20T12:00:00Z"
+ *   }
+ * ]
  */
 
 export class EmbeddingStore {
-  constructor(dbPath) {
-    this.dbPath = dbPath;
-    this.db = null;
-    this.dim = 1024; // Default embedding boyutu
+  constructor(jsonPath) {
+    this.file = jsonPath || path.join(process.cwd(), "memory_data", "semantic.json");
+
+    if (!fs.existsSync(path.dirname(this.file))) {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    }
+
+    if (!fs.existsSync(this.file)) {
+      fs.writeFileSync(this.file, JSON.stringify([]));
+    }
   }
 
   /* --------------------------------------------------------
-   * DB INIT
+   * RAW READ/WRITE
    * ------------------------------------------------------*/
-  async _init() {
-    if (this.db) return;
+  _loadAll() {
+    try {
+      const raw = fs.readFileSync(this.file, "utf8");
+      return JSON.parse(raw);
+    } catch {
+      return [];
+    }
+  }
 
-    this.db = await open({
-      filename: this.dbPath,
-      driver: sqlite3.Database,
-    });
-
-    // Tablo yoksa oluştur
-    await this.db.exec(`
-      CREATE TABLE IF NOT EXISTS embeddings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        text TEXT,
-        meta TEXT,
-        embedding BLOB,
-        timestamp TEXT
-      );
-    `);
+  _saveAll(list) {
+    fs.writeFileSync(this.file, JSON.stringify(list, null, 2));
   }
 
   /* --------------------------------------------------------
-   * EMBEDDING OLUŞTURMA
+   * GENERATE EMBEDDING
    * ------------------------------------------------------*/
   async generateEmbedding(text) {
-    // 1) Modelle embed oluştur
     const result = await runEmbeddingModel(text);
 
     if (!result || !Array.isArray(result.embedding)) {
-      throw new Error("EmbeddingStore: Geçersiz embedding çıktısı.");
+      throw new Error("EmbeddingStore: Invalid embedding output");
     }
-
-    this.dim = result.embedding.length;
 
     return Float32Array.from(result.embedding);
   }
 
   /* --------------------------------------------------------
-   * STORE ITEM
+   * ADD ITEM
    * ------------------------------------------------------*/
-  async storeItem({ text, meta, embedding, timestamp }) {
-    await this._init();
-
-    const buffer = Buffer.from(embedding.buffer);
-
-    await this.db.run(
-      `
-      INSERT INTO embeddings (text, meta, embedding, timestamp)
-      VALUES (?, ?, ?, ?)
-      `,
-      text,
-      JSON.stringify(meta || {}),
-      buffer,
-      timestamp
-    );
+  async add(item) {
+    const list = this._loadAll();
+    list.push(item);
+    this._saveAll(list);
   }
 
   /* --------------------------------------------------------
-   * SEMANTIC SEARCH
+   * SEARCH
    * ------------------------------------------------------*/
-  async searchByEmbedding(queryEmbedding, limit = 5) {
-    await this._init();
-
-    const rows = await this.db.all(`SELECT * FROM embeddings`);
-
-    if (!rows || rows.length === 0) return [];
+  search(queryEmbedding, topK = 5) {
+    const list = this._loadAll();
+    if (list.length === 0) return [];
 
     const q = Array.from(queryEmbedding);
 
-    // cosine similarity hesaplama
-    const similarities = rows.map((row) => {
-      const emb = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
-      const sim = cosineSimilarity(q, emb);
-      return { ...row, score: sim };
-    });
+    const scored = list.map((item) => {
+      const emb = item.embedding;
+      if (!emb || emb.length !== q.length) return null;
 
-    // Skora göre sırala
-    return similarities
+      return {
+        item,
+        score: cosineSimilarity(q, emb),
+      };
+    }).filter(Boolean);
+
+    return scored
       .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
+      .slice(0, topK);
   }
 }
 
@@ -112,9 +104,7 @@ export class EmbeddingStore {
  * COSINE SIMILARITY
  * ------------------------------------------------------*/
 function cosineSimilarity(a, b) {
-  let dot = 0;
-  let na = 0;
-  let nb = 0;
+  let dot = 0, na = 0, nb = 0;
 
   for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
