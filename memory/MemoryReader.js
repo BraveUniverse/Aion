@@ -1,63 +1,79 @@
 // ===== memory/MemoryReader.js =====
+// AION Hybrid Memory — Full Reader Layer
 
 import fs from "fs";
 import { EmbeddingStore } from "./EmbeddingStore.js";
+import { CategoricalMemory } from "./CategoricalMemory.js";
+import { LongTermMemoryEngine } from "./LongTermMemoryEngine.js";
 
 /**
  * MemoryReader
  * -------------------------------------------------------
- * Hybrid Memory'nin okuma katmanı.
+ * AION Hybrid Memory için tüm okuma operasyonlarını yürütür:
  *
- * 3 kaynaktan okur:
- *  - episodic.json
- *  - semantic.json   (embedding store)
- *  - structured.json
+ *  - Episodic Memory (yakın geçmiş)
+ *  - Structured Memory (kalıcı kurallar, bilgiler, projeler)
+ *  - Semantic Memory (embedding store)
+ *  - Categorical Memory (kategori bazlı uzun dönem)
+ *  - Long-Term Memory Engine (özetlenmiş bilgiler)
  *
- * + Fusion Logic: relevance puanı hesaplanır.
+ * Not:
+ *  → MemoryOrchestrator üst katman, Reader alt katmandır.
  */
 
 export class MemoryReader {
-  constructor(paths) {
+  constructor(paths = {}) {
     this.paths = paths;
+
+    // Embedding store (semantic)
     this.semantic = new EmbeddingStore(paths.semantic);
+
+    // Categorical memory
+    this.categorical = new CategoricalMemory(paths.categorical);
+
+    // Long-term memory engine
+    this.longterm = new LongTermMemoryEngine(paths.longterm);
   }
 
   /* ------------------------------------------------------------
-   * EPISODIC MEMORY OKUMA
+   * 1) EPISODIC MEMORY (son konuşmalar)
    * ----------------------------------------------------------*/
   readEpisodic(limit = 50) {
     try {
       const raw = fs.readFileSync(this.paths.episodic, "utf8");
-      const items = JSON.parse(raw);
+      const json = JSON.parse(raw);
 
-      return items.slice(-limit); // son X giriş
-    } catch {
+      // En çok konuşmayı çeken yer burasıdır
+      return json.slice(-limit);
+    } catch (err) {
       return [];
     }
   }
 
   /* ------------------------------------------------------------
-   * STRUCTURED MEMORY OKUMA
+   * 2) STRUCTURED MEMORY (kalıcı bilgiler)
    * ----------------------------------------------------------*/
   readStructured() {
     try {
       const raw = fs.readFileSync(this.paths.structured, "utf8");
-      return JSON.parse(raw);
-    } catch {
+      const json = JSON.parse(raw);
+      return json;
+    } catch (err) {
       return {};
     }
   }
 
   /* ------------------------------------------------------------
-   * SEMANTIC MEMORY SEARCH
+   * 3) SEMANTIC MEMORY SEARCH
    * ----------------------------------------------------------*/
-  async searchSemantic(queryText, topK = 5, threshold = 0.25) {
+  async searchSemantic(queryText, topK = 5, threshold = 0.2) {
     try {
-      const queryEmbedding = await this.semantic.generateEmbedding(queryText);
+      const embedding = await this.semantic.generateEmbedding(queryText);
 
-      const results = this.semantic.search(queryEmbedding, topK);
+      const results = this.semantic.search(embedding, topK);
 
-      return results.filter((r) => r.score >= threshold);
+      // Semantic store format: { item, score }
+      return results.filter(r => r.score >= threshold);
     } catch (err) {
       console.error("Semantic search error:", err);
       return [];
@@ -65,61 +81,119 @@ export class MemoryReader {
   }
 
   /* ------------------------------------------------------------
-   * HYBRID FUSION MEMORY
+   * 4) CATEGORICAL MEMORY READ
+   * ----------------------------------------------------------*/
+  readCategorical() {
+    return this.categorical.getAll();
+  }
+
+  /* ------------------------------------------------------------
+   * 5) LONG-TERM MEMORY SEARCH
+   * ----------------------------------------------------------*/
+  async searchLongTerm(queryText, topK = 5) {
+    try {
+      const res = await this.longterm.search(queryText, topK);
+      return res.map(r => ({
+        source: "longterm",
+        score: r.score ?? 0.6,
+        entry: r
+      }));
+    } catch (err) {
+      console.error("LongTerm search error:", err);
+      return [];
+    }
+  }
+
+  /* ------------------------------------------------------------
+   * 6) HYBRID FUSION MEMORY
    *
-   * Weighted combination of:
-   *   - episodic matches
-   *   - semantic matches
-   *   - structured memory
+   * Modern scoring:
+   *   - Semantic → score olduğu gibi
+   *   - Episodic → zaman decay + low-wt
+   *   - Structured → güçlü kalıcı bilgi
+   *   - Categorical → kategori match
+   *   - Long-term → özetlenmiş hafıza
    * ----------------------------------------------------------*/
   async queryHybridMemory(queryText) {
+    const now = Date.now();
+    const msgLower = queryText.toLowerCase();
+
+    // Pull memory layers
     const episodic = this.readEpisodic(40);
     const structured = this.readStructured();
     const semantic = await this.searchSemantic(queryText, 8, 0.2);
+    const categorical = this.readCategorical();
+    const longterm = await this.searchLongTerm(queryText, 5);
 
-    // scoring
     const fused = [];
 
-    // 1) semantic results zaten score içeriyor
+    /* -------------------------
+     * 1) SEMANTIC MEMORY
+     * -----------------------*/
     for (const r of semantic) {
       fused.push({
         source: "semantic",
         score: r.score * 1.0,
-        entry: r.item,
+        entry: r.item
       });
     }
 
-    // 2) episodic (zaman ağırlıklı)
-    const now = Date.now();
+    /* -------------------------
+     * 2) EPISODIC MEMORY
+     * -----------------------*/
     for (const e of episodic) {
       const ageMs = now - new Date(e.timestamp).getTime();
       const agePenalty = Math.max(0.2, 1 - ageMs / (1000 * 60 * 60 * 24)); // 24 saat decay
 
       fused.push({
         source: "episodic",
-        score: agePenalty * 0.6,
-        entry: e,
+        score: agePenalty * 0.45,
+        entry: e
       });
     }
 
-    // 3) structured (kalıcı → yüksek base score)
+    /* -------------------------
+     * 3) STRUCTURED MEMORY
+     * -----------------------*/
     for (const [key, obj] of Object.entries(structured)) {
+      const rawTxt = JSON.stringify(obj.value || "").toLowerCase();
+      const hit = rawTxt.includes(msgLower);
+
       fused.push({
         source: "structured",
-        score: 0.85,
-        entry: { key, value: obj.value },
+        score: hit ? 0.95 : 0.55,
+        entry: { key, value: obj.value }
       });
     }
 
-    // 4) relevance sorting
+    /* -------------------------
+     * 4) CATEGORICAL MEMORY
+     * -----------------------*/
+    for (const cat of categorical) {
+      const rawTxt = JSON.stringify(cat.data || "").toLowerCase();
+      const hit = rawTxt.includes(msgLower);
+
+      fused.push({
+        source: "categorical",
+        score: hit ? 0.80 : 0.45,
+        entry: cat
+      });
+    }
+
+    /* -------------------------
+     * 5) LONG-TERM MEMORY
+     * -----------------------*/
+    for (const lt of longterm) {
+      fused.push(lt);
+    }
+
     fused.sort((a, b) => b.score - a.score);
 
-    return fused.slice(0, 10);
+    return fused.slice(0, 12);
   }
 
   /* ------------------------------------------------------------
-   * High-level utility:
-   *  → AION beyninin "bana hafızadan en iyi 10 şeyi getir"
+   * 7) High-level recall()
    * ----------------------------------------------------------*/
   async recall(queryText) {
     const items = await this.queryHybridMemory(queryText);
@@ -127,7 +201,7 @@ export class MemoryReader {
     return {
       query: queryText,
       results: items,
-      retrievedAt: new Date().toISOString(),
+      retrievedAt: new Date().toISOString()
     };
   }
 }
