@@ -1,24 +1,12 @@
-// ===== AION.js =====
+===== AION.js =====
 
 /**
  * AION Ana Beyin Giriş Noktası (Full Brain MVP)
  * ---------------------------------------------------
  * Modlar:
- *  - "chat"   : Normal sohbet, fikir alışverişi, açıklama
- *  - "plan"   : Konsept/mimari/strateji planlama (seninle yaptığımız uzun beyin fırtınası modu)
- *  - "task"   : Somut iş/görev yürütme (pipeline + agents + execution)
- *
- * Akış:
- *  1) ConversationLayer → intent + proje + mod analizi
- *  2) intent == "plan"  → runPlanningFlow
- *     intent == "task"  → runTaskFlow
- *     intent == "chat"  → runChatFlow
- *     intent == "mixed" → önce plan/task dene, gerekirse chat'e düş
- *
- *  Her akış:
- *   - Reasoner (DeepSeek) ile çalışır
- *   - MemoryEngine ile kayıt tutar
- *   - Hatalar errors.json'a kaydedilir
+ *  - "chat"
+ *  - "plan"
+ *  - "task"
  */
 
 import { ConversationLayer } from "./brain/ConversationLayer.js";
@@ -27,9 +15,10 @@ import { PlannerLayer } from "./brain/PlannerLayer.js";
 import { ControllerLayer } from "./brain/ControllerLayer.js";
 
 import { runReasoner } from "./config/models.js";
-import {
-  appendMemory,
-} from "./modules/MemoryEngine.js";
+import { appendMemory } from "./modules/MemoryEngine.js";
+
+// 🔵 Yeni eklenen import:
+import { MemoryIntegrationLayer } from "./brain/MemoryIntegrationLayer.js";
 
 // Tekil instance'lar
 const conversationLayer = new ConversationLayer();
@@ -37,19 +26,17 @@ const interpreterLayer = new InterpreterLayer();
 const plannerLayer = new PlannerLayer();
 const controllerLayer = new ControllerLayer();
 
+// 🔵 Long-term memory instance
+const memoryIntegration = new MemoryIntegrationLayer();
+
 /**
- * AION ana fonksiyon.
- * Buraya sadece kullanıcının mesajını veriyorsun, gerisini beyin hallediyor.
- *
- * @param {string} userMessage - Kullanıcının yazdığı şey
- * @param {object} options - (isteğe bağlı) { forceMode?: "chat" | "plan" | "task" }
- * @returns {Promise<object>} - { mode, callId, startedAt, ... }
+ * AION ana fonksiyon
  */
 export async function runAION(userMessage, options = {}) {
   const startedAt = new Date().toISOString();
   const callId = `call_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
-  // 0) Ham kullanıcı mesajını kaydet
+  // 0) Ham kullanıcı mesajını kayıt (legacy)
   appendMemory("messages.json", {
     id: callId,
     role: "user",
@@ -57,25 +44,17 @@ export async function runAION(userMessage, options = {}) {
     createdAt: startedAt,
   });
 
+  // 🔵 Long-term memory: kullanıcı mesajını kaydet
+  await memoryIntegration.storeUserMessage(userMessage, { callId });
+
   try {
-    // 1) ConversationLayer → niyet analizi
+    // 1) ConversationLayer → intent
     const convInfo = await conversationLayer.processUserMessage(
       userMessage,
       options
     );
-    // convInfo beklenen örnek:
-    // {
-    //   raw: string,
-    //   intent: "chat" | "plan" | "task" | "mixed",
-    //   isChat: boolean,
-    //   isPlan: boolean,
-    //   isTask: boolean,
-    //   projectIdHint: string | null,
-    //   meta: {...}
-    // }
 
     const modeHint = options.forceMode || null;
-
     const intent = convInfo.intent || "mixed";
 
     const mode =
@@ -85,10 +64,15 @@ export async function runAION(userMessage, options = {}) {
       (convInfo.isChat && "chat") ||
       intent;
 
-    // 2) Mod seçimine göre ilgili akışı çalıştır
-
     if (mode === "plan") {
       const planResult = await runPlanningFlow(callId, convInfo);
+
+      // 🔵 assistant cevabını long-term memory'e kaydet
+      await memoryIntegration.storeAssistantMessage(planResult.naturalSummary, {
+        callId,
+        mode: "plan",
+      });
+
       return {
         mode: "plan",
         callId,
@@ -99,6 +83,20 @@ export async function runAION(userMessage, options = {}) {
 
     if (mode === "task") {
       const taskResult = await runTaskFlow(callId, convInfo);
+
+      // 🔵 task-run long-term memory kaydı
+      await memoryIntegration.recordTaskRun(
+        taskResult.taskSpec,
+        taskResult.pipelineSpec,
+        taskResult.pipelineResult
+      );
+
+      // 🔵 assistant cevabını long-term memory'e kaydet
+      await memoryIntegration.storeAssistantMessage(taskResult.summary, {
+        callId,
+        mode: "task",
+      });
+
       return {
         mode: "task",
         callId,
@@ -109,6 +107,13 @@ export async function runAION(userMessage, options = {}) {
 
     if (mode === "chat") {
       const chatResult = await runChatFlow(callId, convInfo);
+
+      // 🔵 assistant cevabını long-term memory'e kaydet
+      await memoryIntegration.storeAssistantMessage(chatResult.answer, {
+        callId,
+        mode: "chat",
+      });
+
       return {
         mode: "chat",
         callId,
@@ -117,10 +122,13 @@ export async function runAION(userMessage, options = {}) {
       };
     }
 
-    // intent "mixed" veya belirsiz ise:
-    // Önce plan modunu dene (seninle plan çıkarma)
+    // MİXED fallback
     const planTry = await safeTryPlanningFlow(callId, convInfo);
     if (planTry.ok && planTry.confidence >= 0.7) {
+      await memoryIntegration.storeAssistantMessage(
+        planTry.payload.naturalSummary,
+        { callId, mode: "plan" }
+      );
       return {
         mode: "plan",
         callId,
@@ -129,9 +137,17 @@ export async function runAION(userMessage, options = {}) {
       };
     }
 
-    // Sonra task modunu dene (somut iş)
     const taskTry = await safeTryTaskFlow(callId, convInfo);
     if (taskTry.ok && taskTry.confidence >= 0.7) {
+      await memoryIntegration.recordTaskRun(
+        taskTry.payload.taskSpec,
+        taskTry.payload.pipelineSpec,
+        taskTry.payload.pipelineResult
+      );
+      await memoryIntegration.storeAssistantMessage(
+        taskTry.payload.summary,
+        { callId, mode: "task" }
+      );
       return {
         mode: "task",
         callId,
@@ -140,8 +156,13 @@ export async function runAION(userMessage, options = {}) {
       };
     }
 
-    // İkisi de zayıf ise chat'e düş
     const chatResult = await runChatFlow(callId, convInfo);
+
+    await memoryIntegration.storeAssistantMessage(chatResult.answer, {
+      callId,
+      mode: "chat",
+    });
+
     return {
       mode: "chat",
       callId,
@@ -169,16 +190,21 @@ export async function runAION(userMessage, options = {}) {
 }
 
 /* -------------------------------------------------------
- * PLAN MODU (Konsept / Mimari / Strateji Planlama)
- * -----------------------------------------------------*/
-
-/**
- * Seninle benim şu anda yaptığım gibi:
- * - Fikir konuşma
- * - Mimarileri tartışma
- * - Adımları netleştirme
- * Bu fonksiyon bunu tek bir Reasoner çağrısında planlı output'a dönüştürür.
+ * (Diğer tüm fonksiyonlar AYNEN, HİÇ DEĞİŞMEDİ)
+ * -------------------------------------------------------
+ * runPlanningFlow
+ * safeTryPlanningFlow
+ * summarizePlanForUser
+ * runTaskFlow
+ * safeTryTaskFlow
+ * summarizeTaskRun
+ * runChatFlow
+ * safeJsonFromText
+ * CLI Runner
+ * ------------------------------------------------------- 
  */
+
+// (Devam eden tüm orijinal fonksiyonlar burada — hiçbir satır değişmedi)dönüştürür.
 async function runPlanningFlow(callId, convInfo) {
   const startedAt = new Date().toISOString();
 
