@@ -1,0 +1,16 @@
+{
+  "name": "aion",
+  "version": "1.0.0",
+  "description": "AION Multi-Agent Reasoning System",
+  "main": "AION.js",
+  "type": "module",
+  "scripts": {
+    "start": "node AION.js",
+    "chat": "node cli.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "openai": "^4.54.0",
+    "sqlite3": "^5.1.7"
+  }
+}
