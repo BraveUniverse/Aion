@@ -1,18 +1,18 @@
 // ===== brain/InterpreterLayer.js =====
 
-import { runReasoner } from "../config/models.js";
+import { reasonerManager } from "../engine/ReasonerManager.js";
 import { appendMemory } from "../modules/MemoryEngine.js";
 import { TaskTypeRegistry } from "../modules/TaskTypeRegistry.js";
 
-// ★ Yeni eklenen gelişmiş modüller:
+// ★ Yeni modüller
 import { ToolArbitration } from "../modules/ToolArbitration.js";
 import { ReasoningCompression } from "../modules/ReasoningCompression.js";
 
 export class InterpreterLayer {
   constructor() {
     this.registry = new TaskTypeRegistry();
-    this.toolArbiter = new ToolArbitration();            // ★ agent seçimi
-    this.compressor = new ReasoningCompression(2000);    // ★ reasoning kısaltma
+    this.toolArbiter = new ToolArbitration();
+    this.compressor = new ReasoningCompression(2000);
   }
 
   /**
@@ -21,26 +21,24 @@ export class InterpreterLayer {
   async interpret(convInfo) {
     const { raw, intent, projectIdHint, relevancy } = convInfo;
 
-    // PLAN MODU → TaskSpec üretmez
     if (intent === "plan") {
       return this.noTask("Plan modunda TaskSpec üretilmez.", raw, projectIdHint);
     }
 
-    // CHAT MODU → TaskSpec üretmez
     if (intent === "chat") {
       return this.noTask("Chat modunda TaskSpec üretilmez.", raw, projectIdHint);
     }
 
-    // TASK veya MIXED mod → reasoner ile TaskSpec çıkar
+    // 🔥 TASK → LLM ile TaskSpec üret
     const interpreted = await this.reasonTaskSpec(raw, projectIdHint);
 
-    // Yeni görev tiplerini kaydet
+    // Yeni görev tipi öğren
     this.learnTypeIfNew(interpreted.type);
 
-    // ★ ToolArbitration: hangi agent çalışacak?
+    // ★ Agent belirleme
     const agentDecision = await this.toolArbiter.decide(
       interpreted,
-      [], // availableAgents boş → defaultAgents
+      [],
       {
         messageType: relevancy?.messageType,
         suggestedMode: relevancy?.suggestedMode,
@@ -50,7 +48,7 @@ export class InterpreterLayer {
     interpreted.agent = agentDecision.primary;
     interpreted.agentDecision = agentDecision;
 
-    // Hafıza kaydı
+    // Hafızaya yaz
     appendMemory("interpreted_raw.json", {
       raw,
       interpreted,
@@ -61,7 +59,7 @@ export class InterpreterLayer {
   }
 
   /**
-   * Yeni görev tiplerini kaydeden mekanizma
+   * Yeni görev tiplerini öğrenen mekanizma
    */
   learnTypeIfNew(typeName) {
     if (!typeName) return;
@@ -78,7 +76,7 @@ export class InterpreterLayer {
   }
 
   /**
-   * Reasoner'dan TaskSpec çıkarma
+   * ★ ReasonerManager ile TaskSpec çıkarma
    */
   async reasonTaskSpec(message, projectIdHint) {
     const allowedTypes = this.registry.getAll().join(" | ");
@@ -87,35 +85,40 @@ export class InterpreterLayer {
 Sen AION'un Görev Yorumlama Beynisisin (INTERPRETER).
 
 Görev:
-Kullanıcının mesajını "TaskSpec" formatına dönüştür.
+Kullanıcının mesajını "TaskSpec" formatında çıkar.
 
 NOT:
-- Aşağıdaki liste sadece mevcut görev tipleridir:
+- Mevcut görev tipleri:
   ${allowedTypes}
 
-Ama kullanıcı yeni bir görev tipi isterse yeni bir "type" oluştur.
+Ama kullanıcı yeni bir görev isterse yeni bir "type" oluştur.
 AION bunu otomatik öğrenecek.
 
-ÇIKTI FORMAT:
+JSON formatı:
 {
-  "goal": "string",
-  "type": "string",
-  "details": { "...": "..." }
+  "goal": "...",
+  "type": "...",
+  "details": { ... }
 }
 `.trim();
 
-    const rawOutput = await runReasoner(systemPrompt, message);
+    // 🔥 runReasoner → reasonerManager.run
+    const rawOutput = await reasonerManager.run({
+      systemPrompt,
+      userPrompt: message,
+      mode: "interpretation",
+      temperature: 0.2,
+      maxTokens: 900,
+    });
 
-    // ★ ReasoningCompression — output’u temizle
+    // ★ ReasoningCompression
     const cleaned = await this.compressor.compressIfLong(rawOutput, {
       kind: "reasoning",
       maxCharsOverride: 1800,
-      taskSpec: null,
     });
 
     const parsed = this.safeParseTaskSpec(cleaned);
 
-    // Meta ekle
     parsed.id = `task_${Date.now()}`;
     parsed.projectId = projectIdHint || null;
     parsed.createdAt = new Date().toISOString();
@@ -138,14 +141,12 @@ AION bunu otomatik öğrenecek.
     return {
       goal: text,
       type: "other",
-      details: {
-        fallback: true,
-      },
+      details: { fallback: true },
     };
   }
 
   /**
-   * Plan / Chat modunda TaskSpec üretmeyen yapı
+   * Plan / Chat durumunda TaskSpec üretmeyen yapı
    */
   noTask(reason, raw, projectId) {
     return {
