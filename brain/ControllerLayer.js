@@ -1,6 +1,6 @@
 // ===== brain/ControllerLayer.js =====
 
-import { runReasoner } from "../config/models.js";
+import { reasonerManager } from "../engine/ReasonerManager.js";
 import { ExecutionEngine } from "../engine/ExecutionEngine.js";
 import { appendMemory } from "../modules/MemoryEngine.js";
 import { ReasoningCompression } from "../modules/ReasoningCompression.js";
@@ -131,7 +131,7 @@ export class ControllerLayer {
     };
 
     // -----------------------------------------
-    // 3) PIPELINE HAFIZA AGENT'I ÇALIŞTIR
+    // 3) PIPELINE MEMORY AGENT
     // -----------------------------------------
     try {
       await this.executionEngine.runAgent(
@@ -143,7 +143,6 @@ export class ControllerLayer {
         context
       );
     } catch (err) {
-      // Hafıza hatası pipeline'ı BOZMAZ.
       appendMemory("memory_pipeline_errors.json", {
         error: String(err),
         taskId: taskSpec.id,
@@ -182,10 +181,12 @@ export class ControllerLayer {
     };
   }
 
+  /* -------------------------------------------------------
+   * STEP SELF-CHECK
+   * -----------------------------------------------------*/
   async selfCheckStep(taskSpec, pipelineSpec, step, input, output) {
     const systemPrompt = `
 Sen AION'un STEP SELF-CHECK modülüsün.
-
 Kurallar:
 - ok: boolean
 - reason: kısa açıklama
@@ -205,7 +206,14 @@ Output:
 ${JSON.stringify(output, null, 2)}
 `;
 
-    const raw = await runReasoner(systemPrompt, userPrompt);
+    const raw = await reasonerManager.run({
+      systemPrompt,
+      userPrompt,
+      mode: "step_selfcheck",
+      temperature: 0.0,
+      maxTokens: 750,
+    });
+
     const cleaned = await this.compressor.compressIfLong(raw, {
       kind: "log",
       maxCharsOverride: 1500,
@@ -225,6 +233,9 @@ ${JSON.stringify(output, null, 2)}
     }
   }
 
+  /* -------------------------------------------------------
+   * PIPELINE SELF-CHECK
+   * -----------------------------------------------------*/
   async selfCheckPipeline(taskSpec, pipelineSpec, context, logs, status, failedStep) {
     const systemPrompt = `
 Sen AION'un PIPELINE SELF-CHECK beynisin.
@@ -250,7 +261,14 @@ Logs:
 ${JSON.stringify(logs, null, 2)}
 `;
 
-    const raw = await runReasoner(systemPrompt, userPrompt);
+    const raw = await reasonerManager.run({
+      systemPrompt,
+      userPrompt,
+      mode: "pipeline_selfcheck",
+      temperature: 0.1,
+      maxTokens: 1000,
+    });
+
     const cleaned = await this.compressor.compressIfLong(raw, {
       kind: "summary",
       maxCharsOverride: 2000,
