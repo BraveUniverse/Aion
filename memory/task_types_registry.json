@@ -1,0 +1,12 @@
+{
+  "types": [
+    "create_agent",
+    "create_pipeline",
+    "generate_code",
+    "modify_file",
+    "write_doc",
+    "research",
+    "data_process",
+    "other"
+  ]
+}
