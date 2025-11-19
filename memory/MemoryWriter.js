@@ -2,19 +2,23 @@
 
 import fs from "fs";
 import { EmbeddingStore } from "./EmbeddingStore.js";
+import { CategoricalMemory } from "./CategoricalMemory.js";
 
 /**
- * MemoryWriter
+ * MemoryWriter (Hybrid)
  * -------------------------------------------------------
  * AION'un yazma katmanı.
  *
- * 3 memory alanını yönetir:
- *  - episodic.json     (ham konuşma geçmişi)
- *  - semantic.json     (embedding tabanlı uzun süreli hafıza)
- *  - structured.json   (bilgi kartları, kalıcı bilgiler)
+ * Katmanlar:
+ *  - Episodic: Kısa dönem konuşma geçmişi (sınırlı)
+ *  - Semantic: Embedding tabanlı uzun dönem hafıza
+ *  - Structured: Kalıcı, anahtar-değer bazlı bilgi kartları
+ *  - Categorical: Mesaj tipine göre kategorik hafıza
  *
- * Okuma/Temizleme MemoryEngine'de,
- * Yazma MemoryWriter'da.
+ * Ayrıca:
+ *  - Smart Routing (otomatik memory seçimi)
+ *  - Duplicate Filtering (embedding similarity check)
+ *  - Category autodetection
  */
 
 export class MemoryWriter {
@@ -23,12 +27,47 @@ export class MemoryWriter {
 
     // semantic store
     this.semantic = new EmbeddingStore(paths.semantic);
+
+    // categorical store
+    this.categorical = new CategoricalMemory(paths.categorical);
+  }
+
+  /* ------------------------------------------------------------
+   * PUBLIC: Ana giriş noktası (Smart Hybrid Write)
+   * ----------------------------------------------------------*/
+  async write(entry) {
+    const { type, text, raw } = entry;
+
+    // 1) Episodic her zaman kayıt alır
+    this.appendEpisodic(entry);
+
+    // 2) Kategori belirle
+    const category = this._inferCategory(type, text);
+
+    // 3) Duplicate check
+    const isDup = await this._isDuplicate(text);
+    if (isDup) {
+      return { ok: false, reason: "duplicate_filtered" };
+    }
+
+    // 4) Kategori hafızasına yaz
+    this.categorical.add(category, {
+      type,
+      text,
+      raw,
+      timestamp: new Date().toISOString(),
+    });
+
+    // 5) Semantic embedding’e yaz
+    await this.appendSemantic(category, text, raw);
+
+    return { ok: true, category };
   }
 
   /* ------------------------------------------------------------
    * EPISODIC MEMORY — ham konuşma kaydı (sınırsız büyümez)
    * ----------------------------------------------------------*/
-  appendEpisodic(entry, maxCount = 200) {
+  appendEpisodic(entry, maxCount = 300) {
     let data = [];
 
     try {
@@ -44,7 +83,7 @@ export class MemoryWriter {
       timestamp: new Date().toISOString(),
     });
 
-    // kapasite kontrolü
+    // kapasite
     if (data.length > maxCount) {
       data = data.slice(data.length - maxCount);
     }
@@ -77,9 +116,6 @@ export class MemoryWriter {
 
   /* ------------------------------------------------------------
    * STRUCTURED MEMORY — bilgi kartları
-   *
-   * “UserFact”, “Project”, “Rule”, “Setting” gibi
-   * kalıcı yapısal bilgiler burada tutulur.
    * ----------------------------------------------------------*/
   writeStructured(key, value) {
     let data = {};
@@ -101,6 +137,34 @@ export class MemoryWriter {
       fs.writeFileSync(this.paths.structured, JSON.stringify(data, null, 2));
     } catch (err) {
       console.error("MemoryWriter structured write error:", err);
+    }
+  }
+
+  /* ------------------------------------------------------------
+   * CATEGORY INFERENCE (Auto)
+   * ----------------------------------------------------------*/
+  _inferCategory(type, text) {
+    const t = (text || "").toLowerCase();
+
+    if (type === "code" || t.includes("kod") || t.includes("function")) return "coding";
+    if (type === "plan" || t.includes("mimari")) return "planning";
+    if (t.includes("araştır") || t.includes("research")) return "research";
+    if (t.includes("dosya") || t.includes("patch")) return "file_edit";
+    if (t.includes("agent oluştur") || type === "agent") return "agent";
+    if (t.includes("pipeline")) return "pipeline";
+
+    return "general";
+  }
+
+  /* ------------------------------------------------------------
+   * DUPLICATE FILTER — semantic similarity check
+   * ----------------------------------------------------------*/
+  async _isDuplicate(text) {
+    try {
+      const similars = await this.semantic.query(text, { topK: 3, threshold: 0.92 });
+      return similars.length > 0;
+    } catch (err) {
+      return false;
     }
   }
 }
