@@ -3,6 +3,7 @@
 import { runReasoner } from "../config/models.js";
 import { ExecutionEngine } from "../engine/ExecutionEngine.js";
 import { appendMemory } from "../modules/MemoryEngine.js";
+import { ReasoningCompression } from "../modules/ReasoningCompression.js";
 
 /**
  * ControllerLayer
@@ -15,12 +16,14 @@ import { appendMemory } from "../modules/MemoryEngine.js";
  *  - step.retry desteği
  *  - step bazlı self-check (LLM ile)
  *  - pipeline bazlı self-check
+ *  - ReasoningCompression ile self-check çıktılarının sıkıştırılması
  *  - detaylı log ve context kaydı
  */
 
 export class ControllerLayer {
   constructor() {
     this.executionEngine = new ExecutionEngine();
+    this.compressor = new ReasoningCompression(2000); // ★ LLM çıktıları için
   }
 
   /**
@@ -68,7 +71,7 @@ export class ControllerLayer {
 
           attemptLog.rawOutput = output;
 
-          // Step self-check
+          // Step self-check (LLM + compression)
           const selfCheck = await this.selfCheckStep(
             taskSpec,
             pipelineSpec,
@@ -127,7 +130,7 @@ export class ControllerLayer {
       status = "success";
     }
 
-    // Pipeline-level self-check
+    // Pipeline-level self-check (LLM + compression)
     const pipelineSelfCheck = await this.selfCheckPipeline(
       taskSpec,
       pipelineSpec,
@@ -229,7 +232,14 @@ ${JSON.stringify(output, null, 2)}
 `;
 
     const raw = await runReasoner(systemPrompt, userPrompt);
-    const parsed = this.safeParseSelfCheckStep(raw);
+
+    // ★ LLM çıktısı çok uzunsa sıkıştır
+    const cleaned = await this.compressor.compressIfLong(raw, {
+      kind: "log",
+      maxCharsOverride: 1500,
+    });
+
+    const parsed = this.safeParseSelfCheckStep(cleaned);
 
     return parsed;
   }
@@ -294,7 +304,14 @@ ${JSON.stringify(logs, null, 2)}
 `;
 
     const raw = await runReasoner(systemPrompt, userPrompt);
-    const parsed = this.safeParseSelfCheckPipeline(raw, status);
+
+    // ★ Burada da compress
+    const cleaned = await this.compressor.compressIfLong(raw, {
+      kind: "summary",
+      maxCharsOverride: 2000,
+    });
+
+    const parsed = this.safeParseSelfCheckPipeline(cleaned, status);
 
     return parsed;
   }
