@@ -1,23 +1,22 @@
 // ===== AION.js =====
 
 /**
- * AION Ana Beyin Giriş Noktası (NEW FULL VERSION)
+ * AION Ana Beyin Giriş Noktası (FINAL FULL VERSION)
  * ---------------------------------------------------
  * Modlar:
- *  - "chat"
- *  - "plan"
- *  - "task"
+ *  - "chat"  : Normal sohbet, açıklama, Q&A
+ *  - "plan"  : Mimari / strateji / yol haritası çıkarma
+ *  - "task"  : Somut iş (kod, dosya, pipeline, agent çalıştırma)
  *
- * Tüm LLM çağrıları artık ReasonerManager üzerinden geçer:
- *    reasonerManager.call({ systemPrompt, userPrompt, ... })
+ * Tüm LLM çağrıları ReasonerManager üzerinden geçer:
+ *    reasonerManager.run({ systemPrompt, userPrompt, mode, convInfo? })
  *
  * Böylece:
- *  - Hybrid Memory
- *  - Semantic Memory
+ *  - Hybrid Memory + Long-Term Memory
  *  - Relevancy Engine
- *  - Long-term Memory
  *  - Reasoning Compression
- * otomatik olarak devrede.
+ *  - Tool / Agent seçimi
+ * otomatik devrede.
  */
 
 import { ConversationLayer } from "./brain/ConversationLayer.js";
@@ -27,8 +26,6 @@ import { ControllerLayer } from "./brain/ControllerLayer.js";
 
 import { appendMemory } from "./modules/MemoryEngine.js";
 import { MemoryIntegrationLayer } from "./brain/MemoryIntegrationLayer.js";
-
-// 🔵 Yeni AION Reasoner
 import { reasonerManager } from "./modules/ReasonerManager.js";
 
 // Tekil instance'lar
@@ -40,12 +37,15 @@ const memoryIntegration = new MemoryIntegrationLayer();
 
 /**
  * AION ana fonksiyon
+ *
+ * @param {string} userMessage
+ * @param {object} options - { forceMode?: "chat" | "plan" | "task" }
  */
 export async function runAION(userMessage, options = {}) {
   const startedAt = new Date().toISOString();
   const callId = `call_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
-  // 0) Ham kullanıcı mesajını kaydet (legacy)
+  // 0) Ham kullanıcı mesajını legacy hafızaya yaz
   appendMemory("messages.json", {
     id: callId,
     role: "user",
@@ -53,15 +53,25 @@ export async function runAION(userMessage, options = {}) {
     createdAt: startedAt,
   });
 
-  // 🔵 Long-term memory → kullanıcı mesajını hafızaya at
+  // 🔵 Long-term memory: kullanıcı mesajını kaydet
   await memoryIntegration.storeUserMessage(userMessage, { callId });
 
   try {
-    // 1) ConversationLayer → intent
+    // 1) ConversationLayer → intent + context + proje tahmini
     const convInfo = await conversationLayer.processUserMessage(
       userMessage,
       options
     );
+    // convInfo:
+    // {
+    //   raw,
+    //   intent,
+    //   isChat, isPlan, isTask,
+    //   projectIdHint,
+    //   contextText,
+    //   relevancy,
+    //   meta: { preAnalysis, relevancyAnalysis, deepAnalysis }
+    // }
 
     const modeHint = options.forceMode || null;
     const intent = convInfo.intent || "mixed";
@@ -73,9 +83,13 @@ export async function runAION(userMessage, options = {}) {
       (convInfo.isChat && "chat") ||
       intent;
 
+    // -----------------------------
+    // PLAN MODU
+    // -----------------------------
     if (mode === "plan") {
       const planResult = await runPlanningFlow(callId, convInfo);
 
+      // Assistant cevabı long-term memory'e
       await memoryIntegration.storeAssistantMessage(planResult.naturalSummary, {
         callId,
         mode: "plan",
@@ -84,6 +98,9 @@ export async function runAION(userMessage, options = {}) {
       return { mode: "plan", callId, startedAt, ...planResult };
     }
 
+    // -----------------------------
+    // TASK MODU
+    // -----------------------------
     if (mode === "task") {
       const taskResult = await runTaskFlow(callId, convInfo);
 
@@ -101,6 +118,9 @@ export async function runAION(userMessage, options = {}) {
       return { mode: "task", callId, startedAt, ...taskResult };
     }
 
+    // -----------------------------
+    // CHAT MODU
+    // -----------------------------
     if (mode === "chat") {
       const chatResult = await runChatFlow(callId, convInfo);
 
@@ -112,7 +132,9 @@ export async function runAION(userMessage, options = {}) {
       return { mode: "chat", callId, startedAt, ...chatResult };
     }
 
-    // MİXED fallback
+    // -----------------------------
+    // MIXED → önce plan dene, sonra task, sonra chat
+    // -----------------------------
     const planTry = await safeTryPlanningFlow(callId, convInfo);
     if (planTry.ok && planTry.confidence >= 0.7) {
       await memoryIntegration.storeAssistantMessage(
@@ -160,20 +182,50 @@ export async function runAION(userMessage, options = {}) {
 }
 
 /* -------------------------------------------------------
- * PLAN MODU
+ * PLAN MODU (Konsept / Mimari / Strateji Planlama)
  * ------------------------------------------------------*/
+
 async function runPlanningFlow(callId, convInfo) {
   const startedAt = new Date().toISOString();
 
   const systemPrompt = `
 Sen AION'un PLANLAMA beynisin.
-Görevin: Kullanıcının fikrini düzgün bir plana çevir.
-JSON formatında döndür.
-  `.trim();
+Görevin: Kullanıcının anlattığı fikri, hedefi veya sistemi;
+- önce netleştirmek,
+- sonra mantıklı bir mimari ve adım adım plan haline getirmek,
+- artı/eksi değerlendirmesi yapmak,
+- gerekirse alternatif yaklaşımlar önermek.
+
+Her zaman aşağıdaki JSON formatını döndür:
+
+{
+  "planTitle": "kısa başlık",
+  "goal": "nihai hedef açıklaması",
+  "contextSummary": "kullanıcının anlattıklarının kısa özeti",
+  "steps": [
+    {
+      "id": "step1",
+      "title": "adım başlığı",
+      "description": "detaylı açıklama",
+      "type": "design | research | coding | infra | agent | pipeline | other",
+      "notes": "opsiyonel ek not"
+    }
+  ],
+  "pros": ["avantaj 1", "avantaj 2"],
+  "cons": ["dezavantaj 1", "risk 1"],
+  "suggestedTasks": [
+    {
+      "type": "create_agent | create_pipeline | generate_code | design_schema | other",
+      "description": "somut görevin açıklaması",
+      "priority": "high | normal | low"
+    }
+  ]
+}
+`.trim();
 
   const userPrompt = convInfo.raw;
 
-  const { text: raw } = await reasonerManager.call({
+  const { text: raw } = await reasonerManager.run({
     systemPrompt,
     userPrompt,
     mode: "plan",
@@ -192,6 +244,7 @@ JSON formatında döndür.
 
   const finishedAt = new Date().toISOString();
 
+  // Hafızaya plan kaydı
   appendMemory("plans.json", {
     id: `plan_${Date.now()}`,
     callId,
@@ -202,6 +255,7 @@ JSON formatında döndür.
     finishedAt,
   });
 
+  // Kullanıcıya dönülecek sade plan özeti:
   const naturalSummary = await summarizePlanForUser(parsed);
 
   appendMemory("messages.json", {
@@ -220,48 +274,67 @@ JSON formatında döndür.
   };
 }
 
-/* -------------------------------------------------------
- * SAFE TRY PLAN
- * ------------------------------------------------------*/
+/**
+ * Belirsiz durumda plan denemesi (confidence ile döner)
+ */
 async function safeTryPlanningFlow(callId, convInfo) {
   try {
     const res = await runPlanningFlow(callId, convInfo);
+    // Çok boş bir plan ise confidence düşük olsun
     const hasSteps =
       Array.isArray(res.plan?.steps) && res.plan.steps.length > 0;
     const confidence = hasSteps ? 0.8 : 0.4;
 
-    return { ok: true, confidence, payload: res };
+    return {
+      ok: true,
+      confidence,
+      payload: res,
+    };
   } catch {
-    return { ok: false, confidence: 0, payload: null };
+    return {
+      ok: false,
+      confidence: 0,
+      payload: null,
+    };
   }
 }
 
-/* -------------------------------------------------------
- * PLAN ÖZETİ
- * ------------------------------------------------------*/
+/**
+ * Planı kullanıcıya doğal dille anlatan metin üretir.
+ */
 async function summarizePlanForUser(planJson) {
   const systemPrompt = `
-Sen AION'un plan özetleme modülüsün.
-Kısa ve net Türkçe özet üret.
-  `.trim();
+Sen AION'un doğal dil plan anlatım modülüsün.
+Görevin: Verilen plan JSON'unu,
+kullanıcının anlayacağı, samimi ama net bir Türkçe metne dönüştürmek.
+
+Kurallar:
+- Maksimum 10-12 cümle.
+- Önce hedefi ve ana fikri açıkla.
+- Sonra adımları sırayla özetle.
+- Sonra avantaj ve riskleri kısaca belirt.
+- Son olarak "istersen buradan somut görevlere geçebiliriz" tarzı kısa bir kapanış ekle.
+`.trim();
 
   const userPrompt = JSON.stringify(planJson, null, 2);
 
-  const { text } = await reasonerManager.call({
+  const { text: summary } = await reasonerManager.run({
     systemPrompt,
     userPrompt,
     mode: "plan",
   });
 
-  return text;
+  return summary;
 }
 
 /* -------------------------------------------------------
- * TASK MODU
+ * TASK MODU (Interpreter → Planner → Controller)
  * ------------------------------------------------------*/
+
 async function runTaskFlow(callId, convInfo) {
   const startedAt = new Date().toISOString();
 
+  // 1) Interpreter → TaskSpec
   const taskSpec = await interpreterLayer.interpret(convInfo);
 
   appendMemory("tasks.json", {
@@ -272,7 +345,11 @@ async function runTaskFlow(callId, convInfo) {
     createdAt: startedAt,
   });
 
-  const pipelineSpec = await plannerLayer.plan(taskSpec);
+  // 2) Planner → PipelineSpec
+  const pipelineSpec = await plannerLayer.plan(taskSpec, {
+    suggestedMode: convInfo.intent,
+    messageType: convInfo.relevancy?.messageType,
+  });
 
   appendMemory("pipelines_index.json", {
     id: pipelineSpec.taskId,
@@ -282,6 +359,7 @@ async function runTaskFlow(callId, convInfo) {
     createdAt: new Date().toISOString(),
   });
 
+  // 3) Controller → pipeline'ı Execution üzerinden çalıştırır
   const pipelineResult = await controllerLayer.runPipeline(
     taskSpec,
     pipelineSpec
@@ -300,6 +378,7 @@ async function runTaskFlow(callId, convInfo) {
     finishedAt,
   });
 
+  // 4) Kullanıcı için görev özetini üret
   const summary = await summarizeTaskRun(
     taskSpec,
     pipelineSpec,
@@ -328,28 +407,46 @@ async function runTaskFlow(callId, convInfo) {
   };
 }
 
-/* -------------------------------------------------------
- * SAFE TRY TASK
- * ------------------------------------------------------*/
+/**
+ * Belirsiz durumda task denemesi (confidence ile)
+ */
 async function safeTryTaskFlow(callId, convInfo) {
   try {
     const res = await runTaskFlow(callId, convInfo);
     const ok = res.ok === true;
     const confidence = ok ? 0.8 : 0.4;
-    return { ok: true, confidence, payload: res };
+
+    return {
+      ok: true,
+      confidence,
+      payload: res,
+    };
   } catch {
-    return { ok: false, confidence: 0, payload: null };
+    return {
+      ok: false,
+      confidence: 0,
+      payload: null,
+    };
   }
 }
 
-/* -------------------------------------------------------
- * TASK ÖZETLEYİCİ
- * ------------------------------------------------------*/
+/**
+ * Task pipeline sonuç özetleyici.
+ */
 async function summarizeTaskRun(taskSpec, pipelineSpec, pipelineResult) {
   const systemPrompt = `
 Sen AION'un görev özeti modülüsün.
-Görevi kısa bir özetle anlat.
-  `.trim();
+Görevin: TaskSpec, PipelineSpec ve PipelineResult bilgisini kullanarak,
+kullanıcıya ne yapıldığını net ve kısa bir şekilde anlatmak.
+
+Kurallar:
+- Maksimum 8-10 cümle.
+- Önce görevin amacını özetle.
+- Sonra pipeline'ın ana adımlarını anlat.
+- Sonra önemli çıktıları vurgula (örn. hangi dosyalar üretildi, hangi agent'lar çalıştı).
+- Sorun çıktıysa bunu dürüstçe belirt ve bir sonraki olası adımı öner.
+- Kullanıcıya doğrudan hitap eden bir ton kullan ("dostum" yazmak zorunda değilsin ama istersen yazabilirsin).
+`.trim();
 
   const userPrompt = `
 TaskSpec:
@@ -358,11 +455,11 @@ ${JSON.stringify(taskSpec, null, 2)}
 PipelineSpec:
 ${JSON.stringify(pipelineSpec, null, 2)}
 
-PipelineResult:
+PipelineResult (status: ${pipelineResult.status}):
 ${JSON.stringify(pipelineResult, null, 2)}
 `;
 
-  const { text } = await reasonerManager.call({
+  const { text: summary } = await reasonerManager.run({
     systemPrompt,
     userPrompt,
     mode: "task",
@@ -370,27 +467,35 @@ ${JSON.stringify(pipelineResult, null, 2)}
 
   appendMemory("summaries.json", {
     taskId: taskSpec.id,
-    summary: text,
+    summary,
     createdAt: new Date().toISOString(),
   });
 
-  return text;
+  return summary;
 }
 
 /* -------------------------------------------------------
- * CHAT MODU
+ * CHAT MODU (Normal Sohbet / Açıklama / Q&A)
  * ------------------------------------------------------*/
+
 async function runChatFlow(callId, convInfo) {
   const startedAt = new Date().toISOString();
 
   const systemPrompt = `
-Sen AION'sun — çok katmanlı bir multi-agent beyin.
-Türkçe konuşan kullanıcıya doğal cevap ver.
-  `.trim();
+Sen AION'sun: çok katmanlı, multi-agent bir beyin.
+Görevin: Kullanıcının mesajına doğal, samimi ve teknik olarak doğru cevap vermek.
+
+Kurallar:
+- Kullanıcı Türkçe konuşuyorsa Türkçe cevap ver.
+- Gerekmedikçe aşırı teknik detaya boğma ama önemli yerleri saklama.
+- Eğer kullanıcı AION'un mimarisi, agent'lar, pipeline'lar hakkında konuşuyorsa
+  rahatça detay verebilirsin.
+- Gerektiğinde "bunu plan modunda daha derin konuşabiliriz" diyebilirsin.
+`.trim();
 
   const userPrompt = convInfo.raw;
 
-  const { text: answer } = await reasonerManager.call({
+  const { text: answer } = await reasonerManager.run({
     systemPrompt,
     userPrompt,
     mode: "chat",
@@ -407,31 +512,41 @@ Türkçe konuşan kullanıcıya doğal cevap ver.
     createdAt: finishedAt,
   });
 
-  return { ok: true, answer, finishedAt };
+  return {
+    ok: true,
+    answer,
+    finishedAt,
+  };
 }
 
 /* -------------------------------------------------------
- * SAFELY PARSE JSON
+ * Yardımcı: LLM cevabından güvenli JSON çekme
  * ------------------------------------------------------*/
+
 function safeJsonFromText(text, fallback) {
   try {
     const start = text.indexOf("{");
     const end = text.lastIndexOf("}");
     if (start >= 0 && end > start) {
-      return JSON.parse(text.slice(start, end + 1));
+      const jsonStr = text.slice(start, end + 1);
+      return JSON.parse(jsonStr);
     }
-  } catch {}
+  } catch {
+    // ignore
+  }
   return fallback;
 }
 
 /* -------------------------------------------------------
- * CLI RUNNER
+ * CLI Test Runner (opsiyonel)
+ * node AION.js "Dostum AION mimarisini planlayalım."
  * ------------------------------------------------------*/
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   const msg =
     process.argv.slice(2).join(" ") ||
-    "Dostum AION'un mimarisini planlayalım.";
-  console.log("\n[AION RUNNING]\n");
+    "Dostum AION'un mimarisini ve beyin katmanlarını planlayalım.";
+  console.log("\n[AION] Running...\n");
 
   runAION(msg)
     .then((out) => {
