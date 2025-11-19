@@ -2,73 +2,36 @@
 
 import { runReasoner } from "../config/models.js";
 import { appendMemory } from "../modules/MemoryEngine.js";
-
-/**
- * InterpreterLayer
- * -------------------------------------------------------
- * Görevi: Kullanıcı mesajından "TaskSpec" çıkarmak.
- *
- * Kurallar:
- * - Eğer mod "plan" ise ASLA TaskSpec üretmez → sadece plan aşamasıdır.
- * - Eğer mod "task" ise TaskSpec ZORUNLU olarak üretilir.
- * - Eğer mod "mixed" ise niyet analiz edilir → task uygunsa TaskSpec üretir.
- * - TaskSpec JSON'u strict formatta döner:
- *
- *   {
- *      "id": "task_827364",
- *      "projectId": "xyz" | null,
- *      "goal": "kullanıcının amacı",
- *      "type": "create_agent | create_pipeline | generate_code | modify_file | research | write_doc | other",
- *      "details": {... SERBEST ...},
- *      "createdAt": "timestamp"
- *   }
- *
- */
+import { TaskTypeRegistry } from "../modules/TaskTypeRegistry.js";
 
 export class InterpreterLayer {
-  constructor() {}
+  constructor() {
+    this.registry = new TaskTypeRegistry();
+  }
 
   /**
-   * TaskSpec çıkarma fonksiyonu.
-   * @param {object} convInfo - ConversationLayer çıktısı
+   * Mode'a göre TaskSpec karar mekanizması
    */
   async interpret(convInfo) {
     const { raw, intent, projectIdHint } = convInfo;
 
-    // MODE GUARD: plan modunda TaskSpec ÜRETME
+    // PLAN MODU → TaskSpec üretmez
     if (intent === "plan") {
-      return {
-        id: `task_${Date.now()}`,
-        projectId: projectIdHint || null,
-        goal: raw,
-        type: "no_task_generated",
-        details: {
-          reason:
-            "Plan modunda TaskSpec üretilmez. Önce plan tamamlanmalı, sonra görev başlar.",
-        },
-        createdAt: new Date().toISOString(),
-      };
+      return this.noTask("Plan modunda TaskSpec üretilmez.", raw, projectIdHint);
     }
 
-    // MODE GUARD: chat modunda task üretme
+    // CHAT MODU → TaskSpec üretmez
     if (intent === "chat") {
-      return {
-        id: `task_${Date.now()}`,
-        projectId: projectIdHint || null,
-        goal: raw,
-        type: "no_task_generated",
-        details: {
-          reason:
-            "Chat modunda TaskSpec üretilmez. Bu mesaj bir görev içermiyor.",
-        },
-        createdAt: new Date().toISOString(),
-      };
+      return this.noTask("Chat modunda TaskSpec üretilmez.", raw, projectIdHint);
     }
 
-    // BURAYA GELDİYSE intent = task veya mixed → derin Reasoner gerekiyor
+    // TASK veya MIXED mod → gerçek TaskSpec reasoner
     const interpreted = await this.reasonTaskSpec(raw, projectIdHint);
 
-    // Hafızaya kayıt
+    // Yeni görev tipleri otomatik öğrenilir
+    this.learnTypeIfNew(interpreted.type);
+
+    // Hafıza kaydı
     appendMemory("interpreted_raw.json", {
       raw,
       interpreted,
@@ -78,40 +41,50 @@ export class InterpreterLayer {
     return interpreted;
   }
 
-  /* ------------------------------------------------------------
-   * TaskSpec Reasoning (DeepSeek)
-   * ----------------------------------------------------------*/
+  /**
+   * Yeni görev tiplerini kaydeden mekanizma
+   */
+  learnTypeIfNew(typeName) {
+    if (!typeName) return;
+
+    const existed = this.registry.exists(typeName);
+    if (!existed) {
+      this.registry.register(typeName);
+
+      appendMemory("task_type_learning.json", {
+        learnedType: typeName,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  /**
+   * Reasoner'dan TaskSpec çıkarma
+   */
   async reasonTaskSpec(message, projectIdHint) {
+    const allowedTypes = this.registry.getAll().join(" | ");
+
     const systemPrompt = `
-Sen AION'un Görev Yoruma Beyni (INTERPRETER)'sın.
+Sen AION'un Görev Yorumlama Beynisisin (INTERPRETER).
 
-Görevin:
-Kullanıcının mesajını inceleyip temiz bir "TaskSpec" çıkarmaktır.
+Görev:
+Kullanıcının mesajını "TaskSpec" formatına dönüştür.
 
-Kesin kurallar:
-- Kullanıcı ne istiyorsa onu hedef olarak yaz (goal).
-- "type" alanı somut işi belirtir:
-  - create_agent   → yeni agent oluşturma
-  - create_pipeline → pipeline oluşturma
-  - generate_code   → kod üretme
-  - modify_file     → var olan dosyada değişiklik yapma
-  - write_doc       → teknik döküman oluşturma
-  - research        → araştırma yapma
-  - data_process    → veri üzerinde işlem yapma
-  - other           → diğer işler
-- Details alanına AION'un işine yarayacak tüm ekstra bilgileri koy.
-- Çıkış MUTLAKA pure JSON olacak.
+NOT:
+- Aşağıdaki liste sadece mevcut görev tipleridir:
+  ${allowedTypes}
 
-FORMAT:
+Ama kullanıcı bu listede olmayan BİR TANE BİLE yeni görev tipi isterse:
+- Yeni bir type oluşturabilirsin
+- AION bunu otomatik öğrenecek
+- Kısıtlama yok
+
+ÇIKTI FORMAT (KESİN):
 {
   "goal": "string",
-  "type": "create_agent | create_pipeline | generate_code | modify_file | write_doc | research | data_process | other",
+  "type": "string",
   "details": {
-    "model": "...",
-    "files": ["..."],
-    "path": "...",
-    "inputs": "kullanıcının verdiği teknik istekler",
-    "notes": "opsiyonel"
+    "...": "..."
   }
 }
 `.trim();
@@ -119,7 +92,7 @@ FORMAT:
     const raw = await runReasoner(systemPrompt, message);
     const parsed = this.safeParseTaskSpec(raw);
 
-    // TaskSpec id ekle
+    // ID ve meta ekle
     parsed.id = `task_${Date.now()}`;
     parsed.projectId = projectIdHint || null;
     parsed.createdAt = new Date().toISOString();
@@ -143,8 +116,22 @@ FORMAT:
       goal: text,
       type: "other",
       details: {
-        notes: "Interpreter JSON parse fallback çalıştı.",
+        fallback: true,
       },
+    };
+  }
+
+  /**
+   * Plan / Chat modunda TaskSpec üretmeyen yapı
+   */
+  noTask(reason, raw, projectId) {
+    return {
+      id: `task_${Date.now()}`,
+      projectId,
+      goal: raw,
+      type: "no_task_generated",
+      details: { reason },
+      createdAt: new Date().toISOString(),
     };
   }
 }
